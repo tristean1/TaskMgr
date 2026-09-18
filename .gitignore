@@ -1,0 +1,15 @@
+# ---- Maven / Java build ----
+target/
+
+# ---- Database (single-file, user-local, never commit) ----
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ---- IDE ----
+.idea/
+*.iml
+
+# ---- Secrets ----
+config.properties
