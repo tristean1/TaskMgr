@@ -86,7 +86,9 @@ public static void main(String[] args) throws Exception {
             }
             initSchema(conn);
 
-            Scanner sc = new Scanner(System.in, "UTF-8");
+            // 用系统/控制台默认编码读取输入（Java 17 下默认编码跟随控制台代码页），
+            // 不要写死成 "UTF-8"，否则在 GBK(936) 的 Windows 控制台输入中文会变乱码/问号。
+            Scanner sc = new Scanner(System.in);
             System.out.println("TaskManager. 输入 help 查看用法");
             while (true) {
                 System.out.print("> ");
@@ -258,7 +260,7 @@ public static void main(String[] args) throws Exception {
                   .append(" (").append(type).append(")");
                 if (!due.isEmpty()) sb.append(" DDL ").append(due);
                 sb.append("  ").append(title);
-                if (note != null && !note.isEmpty()) sb.append("  ␣").append(note);
+                if (note != null && !note.isEmpty()) sb.append("  ").append(note);
                 System.out.println(sb);
             }
             if (n == 0) System.out.println("  （暂无任务，输入 `add 标题` 添加）");
