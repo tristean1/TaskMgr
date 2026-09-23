@@ -11,5 +11,10 @@ javac -encoding UTF-8 -cp $cp -d 'target\classes' `
   'src\main\java\ReminderService.java' `
   'src\main\java\Autostart.java' `
   'src\main\java\ReminderMain.java' `
-  'src\main\java\IcsExporter.java'
+  'src\main\java\IcsExporter.java' `
+  'src\main\java\ParsedTask.java' `
+  'src\main\java\NlParser.java' `
+  'src\main\java\NlParseException.java' `
+  'src\main\java\ParsedTaskValidator.java' `
+  'src\main\java\ValidationException.java'
 Write-Output ("EXITCODE=" + $LASTEXITCODE)

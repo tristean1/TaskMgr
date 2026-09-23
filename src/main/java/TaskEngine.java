@@ -30,7 +30,7 @@ public class TaskEngine {
             " , note             TEXT\n" +
             " , trigger_type     TEXT    NOT NULL DEFAULT 'once'\n" +
             " , status           TEXT    NOT NULL DEFAULT 'todo'\n" +
-            " , priority         INTEGER NOT NULL DEFAULT 5\n" +
+            " , priority         INTEGER NOT NULL DEFAULT 1\n" +
             " , trigger_at       INTEGER\n" +
             " , remind_at        INTEGER\n" +
             " , estimate_minutes INTEGER\n" +
@@ -101,12 +101,12 @@ public class TaskEngine {
         return true;
     }
 // ─────────────────────────── add ───────────────────────────
-    /** add <标题> [-n 备注] [-p 优先级0-5] [-g once|recurring|ongoing] [-t 触发时刻] [-a 提醒时刻] */
+    /** add <标题> [-n 备注] [-p 优先级1-9] [-g once|recurring|ongoing] [-t 触发时刻] [-a 提醒时刻] */
     private void handleAdd(String[] argv) {
         String title = null;
         String note = null;
         String triggerType = "once";
-        int priority = 5;
+        int priority = 1;
         Long triggerAt = null;
         Long remindAt = null;
 
@@ -158,8 +158,8 @@ public class TaskEngine {
             out.accept("[提示] 触发类型必须为 once / recurring / ongoing，得到: " + triggerType);
             return;
         }
-        if (priority < 0 || priority > 5) {
-            out.accept("[提示] 优先级 priority 应为 0–5，得到: " + priority);
+        if (priority < 1 || priority > 9) {
+            out.accept("[提示] 优先级 priority 应为 1–9，得到: " + priority);
             return;
         }
         if (remindAt != null && triggerAt != null && remindAt > triggerAt) {
@@ -350,7 +350,7 @@ public class TaskEngine {
     // ─────────────────────────── help ───────────────────────────
     private void handleHelp(String[] argv) {
         out.accept("用法：\n"
-            + "  add <标题> [-n 备注] [-p 优先级0-5] [-g once|recurring|ongoing] [-t 触发时刻] [-a 提醒时刻]\n"
+            + "  add <标题> [-n 备注] [-p 优先级1-9] [-g once|recurring|ongoing] [-t 触发时刻] [-a 提醒时刻]\n"
             + "  list | ls          —— 列出未删除任务\n"
             + "  done [任务名]      —— 完成任务（留空=上次提醒的任务）\n"
             + "  remove [任务名]    —— 移除任务（留空=上次提醒的任务）\n"
