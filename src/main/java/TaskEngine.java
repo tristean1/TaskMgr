@@ -88,6 +88,8 @@ public class TaskEngine {
             case "add":       handleAdd(argv);   break;
             case "list":
             case "ls":        handleList(argv);  break;
+            case "done":      handleSetStatus(argv, "done");    break;
+            case "remove":    handleSetStatus(argv, "removed"); break;
             case "init":      handleInit();      break;
             case "help":
             case "?":         handleHelp(argv);  break;
@@ -163,6 +165,11 @@ public class TaskEngine {
             out.accept("[提示] 提醒时刻 -a 不能在触发时刻 -t 之后");
             return;
         }
+        // 同名校验：仅拦截未完成、未删除的任务；已 removed/done 的允许重名创建。
+        if (hasActiveTask(title)) {
+            out.accept("[提示] 已存在同名任务: \"" + title + "\"，请先 done/remove 后再添加");
+            return;
+        }
         addTask(title, note, triggerType, priority, triggerAt, remindAt);
         out.accept("[OK] 已添加: \"" + title + "\" (priority=" + priority + ", type=" + triggerType + ")"
                 + (triggerAt != null ? ", 触发=" + fmtEpoch(triggerAt) : ", 无触发时刻")
@@ -201,6 +208,73 @@ public class TaskEngine {
             out.accept("[错误] 插入任务失败: " + e.getMessage());
         }
     }
+// ─────────────────────────── done / remove ───────────────────────────
+    /**
+     * done/remove <任务名>：把指定任务置为 done / removed；不写任务名时作用于
+     * 「上次提醒过的任务」（last_notified_at 最晚且未完成未删除）。
+     */
+    private void handleSetStatus(String[] argv, String newStatus) {
+        String title = null;
+        String id = null;
+        try {
+            if (argv.length == 0) {
+                // 留空 -> 上次提醒的任务
+                String sql = "SELECT id,title FROM tasks "
+                        + "WHERE status NOT IN ('done','removed') AND last_notified_at IS NOT NULL "
+                        + "ORDER BY last_notified_at DESC LIMIT 1";
+                try (PreparedStatement ps = conn.prepareStatement(sql);
+                     ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) { id = rs.getString("id"); title = rs.getString("title"); }
+                }
+                if (id == null) {
+                    out.accept("[提示] 没有最近提醒过的任务");
+                    return;
+                }
+            } else {
+                title = String.join(" ", argv);
+                String sql = "SELECT id, title, status FROM tasks "
+                        + "WHERE title=? AND status NOT IN ('done','removed') "
+                        + "ORDER BY created_at DESC LIMIT 1";
+                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                    ps.setString(1, title);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) { id = rs.getString("id"); title = rs.getString("title"); }
+                    }
+                }
+                if (id == null) {
+                    out.accept("[提示] 未找到未完成任务: \"" + title + "\"");
+                    return;
+                }
+            }
+
+            long now = Instant.now().toEpochMilli();
+            String u = "UPDATE tasks SET status=?, done_at=?, updated_at=? WHERE id=?";
+            try (PreparedStatement ps = conn.prepareStatement(u)) {
+                ps.setString(1, newStatus);
+                if ("done".equals(newStatus)) ps.setLong(2, now); else ps.setNull(2, Types.INTEGER);
+                ps.setLong(3, now);
+                ps.setString(4, id);
+                ps.executeUpdate();
+            }
+            out.accept("[OK] 任务已设为 " + newStatus + ": \"" + title + "\"");
+        } catch (SQLException e) {
+            out.accept("[错误] " + newStatus + " 失败: " + e.getMessage());
+        }
+    }
+
+    /** 是否存在未完成未删除的同名任务。 */
+    private boolean hasActiveTask(String title) {
+        String sql = "SELECT COUNT(*) FROM tasks WHERE title=? AND status NOT IN ('done','removed')";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, title);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getInt(1) > 0;
+            }
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
 // ─────────────────────────── list ───────────────────────────
     /** list —— 列出所有未删除任务。 */
     private void handleList(String[] argv) {
@@ -254,11 +328,13 @@ public class TaskEngine {
         out.accept("用法：\n"
             + "  add <标题> [-n 备注] [-p 优先级0-5] [-g once|recurring|ongoing] [-t 触发时刻] [-a 提醒时刻]\n"
             + "  list | ls          —— 列出未删除任务\n"
+            + "  done [任务名]      —— 完成任务（留空=上次提醒的任务）\n"
+            + "  remove [任务名]    —— 移除任务（留空=上次提醒的任务）\n"
             + "  init               —— 重建数据库表（危险）\n"
             + "  help | ?           —— 显示本帮助\n"
             + "\n-t / -a 触发时刻支持两种写法：\n"
             + "  1) 绝对日期：year2026 month9 day20 time20:14（缺省组件取当天，缺 time 取 00:00）\n"
-            + "  2) 增量时间：T+1h（一小时后）、+30m、+1d"
+            + "  2) 增量时间：T+1h（一小时后）、+30m、+1d\n"
         );
     }
 // ─────────────────────────── 建表 ───────────────────────────

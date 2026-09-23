@@ -64,8 +64,20 @@ public class QqWsClient {
     private ScheduledExecutorService heartbeatTimer;
     private volatile long heartbeatIntervalMs = 45_000L;
 
+    /**
+     * 帧处理线程：单线程串行，既避免阻塞 selector 读线程，又保证帧按序处理。
+     */
+    private final java.util.concurrent.ExecutorService handlerExecutor =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "qqbot-ws-handler");
+                t.setDaemon(true);
+                return t;
+            });
+
     /** 重连退避，避免断线风暴。 */
     private int reconnectAttempt = 0;
+    /** Resume 连续失败计数，达到阈值后退回全新 Identify。 */
+    private volatile int resumeFailures = 0;
 
     public interface TokenSupplier {
         /** 返回不带前缀的 access_token。 */
@@ -112,9 +124,16 @@ public class QqWsClient {
     // ───────────────────────── 单次连接 ─────────────────────────
 
     private void connectOnce() throws Exception {
-        String url = resumeGatewayUrl != null ? resumeGatewayUrl : fetchGatewayUrl();
+        String url;
+        if (resumeGatewayUrl != null) {
+            url = resumeGatewayUrl;             // Resume 必须用同一网关
+        } else {
+            url = fetchGatewayUrl();
+            resumeGatewayUrl = url;             // 记录，供后续 Resume 复用
+        }
         log("[WS] 正在连接 " + url + (sessionId != null ? "（带 session 恢复）" : "（全新登录）"));
 
+        // identify/resume 成功（READY/RESUMED）之前不重置，失败时保留退避
         WebSocket.Listener listener = new Listener();
         WebSocket socket = http.newWebSocketBuilder()
                 .connectTimeout(java.time.Duration.ofSeconds(20))
@@ -125,6 +144,9 @@ public class QqWsClient {
         // 后续动作（Identify / 心跳）由 Listener 收到 OP 10 Hello 后驱动，
         // 因为必须等 Hello 才知道 heartbeat_interval。
         awaitClose();
+
+        // 连接结束后清空引用，避免心跳线程往已关闭的连接写数据
+        this.ws = null;
     }
 
     /** 拉取通用网关地址。 */
@@ -181,11 +203,15 @@ public class QqWsClient {
     private void send(String json) {
         WebSocket s = ws;
         if (s == null) return;
-        if (json.length() > 3800) {
-            // 官方限制：发送 payload 过快/过大都可能被断，这里只做体积预警
-            log("[WS] 警告：心跳/鉴权报文异常大（" + json.length() + " 字节）");
+        try {
+            // 必须持有返回的 future 并处理异常，否则发送静默失败（曾导致心跳发不出去、
+            // 服务器 2 分钟后以 4009 Session timed out 踢连接）。
+            s.sendText(json, true).whenComplete((r, ex) -> {
+                if (ex != null) log("[WS] 发送失败: " + ex.getMessage());
+            });
+        } catch (Throwable t) {
+            log("[WS] 发送异常: " + t.getMessage());
         }
-        s.sendText(json, true);
     }
 
     /** OP 2 Identify：全新登录。 */
@@ -227,24 +253,35 @@ public class QqWsClient {
 
     private void startHeartbeat() {
         stopHeartbeat();
+        final long gen = ++connectionGeneration;
         heartbeatTimer = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "qqbot-ws-heartbeat");
             t.setDaemon(true);
             return t;
         });
+        // 官方建议：心跳周期取 heartbeat_interval，实际发送略提前以免边界抖动被判超时
+        long period = Math.max(5_000L, (long) (heartbeatIntervalMs * 0.8));
         heartbeatTimer.scheduleAtFixedRate(() -> {
+            // 连接换代后旧定时器不得再发（避免往已关闭连接写数据）
+            if (gen != connectionGeneration || closed.get()) return;
             try {
                 JsonObject p = new JsonObject();
                 p.addProperty("op", 1);
                 if (hasSeq) p.addProperty("d", lastSeq.get());
                 else p.add("d", com.google.gson.JsonNull.INSTANCE); // 首次心跳 d=null
                 send(p.toString());
+                if (verboseHeartbeat) log("[WS] 心跳已发送 seq=" + (hasSeq ? lastSeq.get() : -1));
             } catch (Throwable t) {
                 log("[WS] 心跳发送失败: " + t.getMessage());
             }
-        }, heartbeatIntervalMs, heartbeatIntervalMs, TimeUnit.MILLISECONDS);
-        log("[WS] 心跳已启动，周期 " + heartbeatIntervalMs + "ms");
+        }, period, period, TimeUnit.MILLISECONDS);
+        log("[WS] 心跳已启动，实际周期 " + period + "ms（服务端要求 " + heartbeatIntervalMs + "ms）");
     }
+
+    /** 连接代号：每次 startHeartbeat 自增，用于作废旧定时器。 */
+    private volatile long connectionGeneration = 0;
+    /** 是否打印每次心跳（排查 4009 超时时打开）。 */
+    private volatile boolean verboseHeartbeat = true;
 
     private void stopHeartbeat() {
         ScheduledExecutorService t = heartbeatTimer;
@@ -264,6 +301,15 @@ public class QqWsClient {
 
     // ───────────────────────── 帧处理 ─────────────────────────
 
+    /**
+     * 帧处理器。
+     * <p>
+     * 注意：{@code onText} 运行在 HttpClient 的 selector 线程上，
+     * <b>绝不能在其中做阻塞操作</b>（例如获取 access_token 的同步 HTTP 请求），
+     * 否则会卡住读线程，导致紧随 Hello 之后的 READY 读不出来，
+     * 表现为「心跳正常但 2 分钟后 4009 Session timed out」。
+     * 因此所有回包动作都丢到独立线程执行。
+     */
     private class Listener implements WebSocket.Listener {
         private final StringBuilder buf = new StringBuilder();
 
@@ -279,31 +325,51 @@ public class QqWsClient {
             if (last) {
                 String text = buf.toString();
                 buf.setLength(0);
+                // 先 request(1) 保证读线程不被后续处理阻塞，再异步处理
+                webSocket.request(1);
+                dispatchAsync(text);
+                return null;
+            }
+            webSocket.request(1);
+            return null;
+        }
+
+        /** 把帧处理放到独立线程，避免阻塞 selector 读线程。 */
+        private void dispatchAsync(String text) {
+            handlerExecutor.execute(() -> {
                 try {
                     handleFrame(text);
                 } catch (Throwable t) {
                     log("[WS] 处理帧失败: " + t.getMessage());
                 }
-            }
-            webSocket.request(1);
-            return null;
+            });
         }
 
         @Override
         public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
             log("[WS] 连接关闭 code=" + statusCode + " reason=" + reason + describeCode(statusCode));
             stopHeartbeat();
-            // 4009 可 resume；多数错误需重新 identify
-            if (statusCode == 4009 || statusCode == 4008) {
-                log("[WS] 该错误码可尝试 Resume");
-            } else if (statusCode == 4914 || statusCode == 4915) {
-                log("[WS] 机器人已下架/封禁，停止重连");
+            if (statusCode == 4914 || statusCode == 4915) {
+                // 已下架/封禁，重连无意义
+                log("[WS] 机器人已下架或封禁，停止重连");
                 closed.set(true);
+            } else if (statusCode == 4009 || statusCode == 4008 || statusCode == 4006 || statusCode == 4007) {
+                // 这些错误码官方的建议是重试，但 Resume 已经反复失败时不能无限 resume，
+                // 否则会陷入「Resume → 2 分钟后 4009 → 再 Resume」的死循环（实测如此）。
+                resumeFailures++;
+                if (resumeFailures >= 2) {
+                    log("[WS] Resume 连续失败 " + resumeFailures + " 次，改为全新 Identify");
+                    sessionId = null;
+                    resumeGatewayUrl = null;
+                    hasSeq = false;
+                    resumeFailures = 0;
+                }
             } else if (statusCode != WebSocket.NORMAL_CLOSURE) {
-                // 会话失效，下次全新 Identify
+                // 会话无效，下次全新登录
                 sessionId = null;
                 resumeGatewayUrl = null;
                 hasSeq = false;
+                resumeFailures = 0;
             }
             signalClosed();
             return null;
@@ -339,6 +405,14 @@ public class QqWsClient {
                 }
                 case 11: // Heartbeat ACK
                     break;
+                case 1: { // 服务端主动要求心跳，需立即回一个
+                    JsonObject p = new JsonObject();
+                    p.addProperty("op", 1);
+                    if (hasSeq) p.addProperty("d", lastSeq.get());
+                    else p.add("d", com.google.gson.JsonNull.INSTANCE);
+                    send(p.toString());
+                    break;
+                }
                 case 0: { // Dispatch
                     if (msg.has("s") && !msg.get("s").isJsonNull()) {
                         lastSeq.set(msg.get("s").getAsLong());

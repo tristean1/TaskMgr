@@ -7,5 +7,9 @@ javac -encoding UTF-8 -cp $cp -d 'target\classes' `
   'src\main\java\Main.java' `
   'src\main\java\TaskEngine.java' `
   'src\main\java\QqBot.java' `
+  'src\main\java\QqWsClient.java' `
+  'src\main\java\ReminderService.java' `
+  'src\main\java\Autostart.java' `
+  'src\main\java\ReminderMain.java' `
   'src\main\java\Text.java'
 Write-Output ("EXITCODE=" + $LASTEXITCODE)

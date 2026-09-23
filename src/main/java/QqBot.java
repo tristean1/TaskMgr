@@ -80,7 +80,7 @@ public class QqBot {
     }
 // ───────────────────────────── 配置加载 ─────────────────────────────
     /** 加载 rsc/qqbot.properties（含 appid/appsecret/提醒目标/监听端口），读取失败时给出明确提示。 */
-    private void loadConfig() throws IOException {
+    public void loadConfig() throws IOException {
         Properties p = new Properties();
         InputStream in = QqBot.class.getClassLoader().getResourceAsStream("qqbot.properties");
         if (in == null) {
@@ -118,6 +118,8 @@ public class QqBot {
     private String mode = "websocket";
     /** WebSocket 客户端（仅 websocket 模式非空）。 */
     private QqWsClient wsClient;
+    /** 消息收发是否已开启（用于 Main 的 qqbot up/down 状态）。 */
+    private volatile boolean messagingUp = false;
 
     private boolean isWsMode() {
         return !"webhook".equals(mode);
@@ -130,14 +132,49 @@ public class QqBot {
     /** 启动提醒线程 + 事件接入（WebSocket 或 Webhook），并阻塞直到应用退出。 */
     public void start() throws Exception {
         startReminderLoop();
+        startMessaging();
+        Thread.currentThread().join(); // 阻塞主线程
+    }
+
+    /**
+     * 只开启「消息收发」能力（WebSocket 或 Webhook），不启提醒扫描，也不阻塞。
+     * 供主命令行 {@code qqbot up} 使用；可配合 {@link #stopMessaging()} 开关。
+     */
+    public synchronized void startMessaging() throws Exception {
+        if (messagingUp) {
+            System.out.println("[QQBot] 消息功能已在运行（请先 qqbot down）");
+            return;
+        }
         if (isWsMode()) {
             startWebSocket();
         } else {
             startHttpServer();
             System.out.println("[QQBot] 已启动，Webhook 端口=" + port
-                    + "。请在开放平台配置回调地址指向本机的内网穿透公网地址。Ctrl+C 退出。");
+                    + "。请在开放平台配置回调地址指向本机的内网穿透公网地址。");
         }
-        Thread.currentThread().join(); // 阻塞主线程
+        messagingUp = true;
+        System.out.println("[QQBot] 消息收发已开启（模式=" + mode + "）");
+    }
+
+    /** 关闭消息收发（WebSocket / Webhook）。幂等。 */
+    public synchronized void stopMessaging() {
+        if (!messagingUp) {
+            System.out.println("[QQBot] 消息收发本就处于关闭状态");
+            return;
+        }
+        try {
+            if (wsClient != null) { wsClient.close(); wsClient = null; }
+        } catch (Throwable t) { log("[错误] 关闭 WebSocket 失败: " + t.getMessage()); }
+        try {
+            if (server != null) { server.stop(0); server = null; }
+        } catch (Throwable t) { log("[错误] 关闭 Webhook 失败: " + t.getMessage()); }
+        messagingUp = false;
+        System.out.println("[QQBot] 消息收发已关闭");
+    }
+
+    /** 消息收发是否已开启。 */
+    public boolean isUp() {
+        return messagingUp;
     }
 
     /**
@@ -501,9 +538,11 @@ public class QqBot {
                     localAlert(line);
                     // QQ 推送
                     pushToQQ(line);
-                    
+
                     // 触发后更新 last_notified_at，WHERE 保证并发下也只写一次
                     markNotified(c, id, now);
+                    // 成功也记一笔，否则「提醒到底有没有触发」无法从日志判断
+                    log("[提醒] 已触发: " + title);
                 }
             }
         } catch (Exception e) {
@@ -561,6 +600,11 @@ public class QqBot {
             else if ("user".equals(kind)) sendC2c(id, text);
             else log("[提醒] 未知目标类型(需 user/group): " + target);
         }
+    }
+
+    /** 对外暴露的提醒推送入口：把文本推给已登记目标（供 Main 的 ReminderService 回调调用）。 */
+    public void pushRemind(String text) {
+        pushToQQ(text);
     }
 
     /** 更新 last_notified_at，防止重复提醒。 */

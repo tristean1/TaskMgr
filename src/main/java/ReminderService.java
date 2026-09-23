@@ -14,9 +14,16 @@ import java.util.concurrent.TimeUnit;
 public class ReminderService {
     private final Connection conn;            // 外部传入，调用方负责 open/close
     private ScheduledExecutorService timer;
+    /** 到点提醒后额外回调（供主命令行接入 QQ 推送等），可为 null。 */
+    private volatile java.util.function.Consumer<String> onTaskRemind;
 
     public ReminderService(Connection conn) {
         this.conn = conn;
+    }
+
+    /** 设置提醒触发后的额外回调（文本为拼接好的提醒正文）。传 null 取消。 */
+    public void setOnTaskRemind(java.util.function.Consumer<String> cb) {
+        this.onTaskRemind = cb;
     }
 
     /**
@@ -68,10 +75,15 @@ public class ReminderService {
                     }
                     
                     String line = buildRemindText(title, note, remindAt);
+                    // 本地弹窗 + 出声
                     localAlert(line);
-                    
                     // 触发后更新 last_notified_at，WHERE 保证并发下也只写一次
                     markNotified(id, now);
+                    // 额外回调（如 QQ 推送），在标记成功后执行
+                    java.util.function.Consumer<String> cb = onTaskRemind;
+                    if (cb != null) {
+                        try { cb.accept(line); } catch (Throwable ignore) {}
+                    }
                 }
             }
         } catch (Exception e) {
