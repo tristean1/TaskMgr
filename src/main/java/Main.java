@@ -8,6 +8,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Scanner;
 import java.util.UUID;
+import java.util.concurrent.*;
 
 /**
  * TaskManager — 效率工具（任务管理 + DDL 提醒）
@@ -86,6 +87,10 @@ public static void main(String[] args) throws Exception {
             }
             initSchema(conn);
 
+            // 启动提醒服务：先立刻补发一次, 之后每10秒
+            ReminderService reminder = new ReminderService(conn);
+            reminder.start(0, 10_000L);
+
             // 用系统/控制台默认编码读取输入（Java 17 下默认编码跟随控制台代码页），
             // 不要写死成 "UTF-8"，否则在 GBK(936) 的 Windows 控制台输入中文会变乱码/问号。
             Scanner sc = new Scanner(System.in);
@@ -115,6 +120,9 @@ public static void main(String[] args) throws Exception {
                     case "help":
                     case "?":
                         handleHelp(argv);
+                        break;
+                    case "autostart":
+                        handleAutostart(argv);
                         break;
                     case "exit":
                     case "quit":
@@ -289,6 +297,7 @@ public static void main(String[] args) throws Exception {
         System.out.println("  add <标题> [-n 备注] [-p 优先级0-5] [-g once|recurring|ongoing] [-t 触发时刻] [-a 提醒时刻]");
         System.out.println("  list | ls          —— 列出未删除任务");
         System.out.println("  init               —— 重建数据库表（危险）");
+        System.out.println("  autostart on|off|status —— 开机自启动管理");
         System.out.println("  help | ?           —— 显示本帮助");
         System.out.println("  exit | quit        —— 退出");
         System.out.println();
@@ -461,5 +470,49 @@ public static void main(String[] args) throws Exception {
         int j = index;
         while (j + 1 < argv.length && !argv[j + 1].startsWith("-")) j++;
         return j;
+    }
+
+    /**
+     * 处理 autostart 命令：on|off|status
+     * 映射到 Autostart；on 时命令指向 ReminderMain。
+     */
+    private static void handleAutostart(String[] argv) {
+        if (argv.length == 0) {
+            System.out.println("用法: autostart on|off|status");
+            return;
+        }
+        
+        String subcmd = argv[0].toLowerCase();
+        switch (subcmd) {
+            case "on":
+                // 构建 ReminderMain 的启动命令
+                String javaHome = System.getProperty("java.home");
+                String javaExe = javaHome + "\\bin\\java.exe";
+                String classpath = "target\\classes";
+                String mainClass = "ReminderMain";
+                String command = "\"" + javaExe + "\" -cp \"" + classpath + "\" " + mainClass;
+                
+                Autostart.enable(command);
+                System.out.println("已启用开机自启动");
+                System.out.println("命令: " + command);
+                break;
+                
+            case "off":
+                Autostart.disable();
+                System.out.println("已禁用开机自启动");
+                break;
+                
+            case "status":
+                if (Autostart.isEnabled()) {
+                    System.out.println("开机自启动: 已启用");
+                    System.out.println("命令: " + Autostart.getCommand());
+                } else {
+                    System.out.println("开机自启动: 已禁用");
+                }
+                break;
+                
+            default:
+                System.out.println("未知子命令: " + subcmd + "，可用: on|off|status");
+        }
     }
 }

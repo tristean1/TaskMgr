@@ -98,6 +98,8 @@ public class QqBot {
         this.appSecret = p.getProperty("appsecret", "");
         this.verbose = "1".equals(p.getProperty("verbose", "1"));
         int port = Integer.parseInt(p.getProperty("port", "9000"));
+        // 接入模式：websocket（默认，无需公网 IP）/ webhook（需内网穿透）
+        this.mode = p.getProperty("mode", "websocket").trim().toLowerCase();
         String to = p.getProperty("remind.to", "");
         if (to != null) {
             for (String s : to.split("[,;]")) {
@@ -105,24 +107,53 @@ public class QqBot {
                 if (!t.isEmpty()) remindTargets.add(t);
             }
         }
-        System.out.println("[QQBot] appid=" + blankOr(appId) + ", 端口=" + port
+        System.out.println("[QQBot] appid=" + blankOr(appId) + ", 模式=" + mode
+                + (isWsMode() ? "" : ", 端口=" + port)
                 + ", 提醒目标=" + remindTargets);
         this.port = port;
     }
 
     private int port = 9000;
+    /** 接入模式：websocket | webhook。 */
+    private String mode = "websocket";
+    /** WebSocket 客户端（仅 websocket 模式非空）。 */
+    private QqWsClient wsClient;
+
+    private boolean isWsMode() {
+        return !"webhook".equals(mode);
+    }
 
     private static String blankOr(String s) {
         return (s == null || s.isEmpty()) ? "（未配置）" : "***" + s.substring(Math.max(0, s.length() - 4));
     }
 // ───────────────────────────── 启动 ─────────────────────────────
-    /** 启动 Webhook 服务 + 提醒线程，并阻塞直到应用退出。 */
+    /** 启动提醒线程 + 事件接入（WebSocket 或 Webhook），并阻塞直到应用退出。 */
     public void start() throws Exception {
         startReminderLoop();
-        startHttpServer();
-        System.out.println("[QQBot] 已启动，Webhook 端口=" + port
-                + "。请在开放平台配置回调地址指向本机的内网穿透公网地址。Ctrl+C 退出。");
+        if (isWsMode()) {
+            startWebSocket();
+        } else {
+            startHttpServer();
+            System.out.println("[QQBot] 已启动，Webhook 端口=" + port
+                    + "。请在开放平台配置回调地址指向本机的内网穿透公网地址。Ctrl+C 退出。");
+        }
         Thread.currentThread().join(); // 阻塞主线程
+    }
+
+    /**
+     * WebSocket 模式：本机主动连 QQ 网关，无需公网 IP。
+     * 事件回调复用同一套 {@link #dispatchEvent} 逻辑，因此命令行为与 Webhook 完全一致。
+     */
+    private void startWebSocket() {
+        wsClient = new QqWsClient(
+                this::accessToken,
+                (t, d) -> dispatchEvent(t, d),
+                this::log);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (wsClient != null) wsClient.close();
+        }));
+        System.out.println("[QQBot] 已启动（WebSocket 模式，无需公网 IP）。Ctrl+C 退出。");
+        new Thread(() -> wsClient.runForever(), "qqbot-ws").start();
     }
 
     // ───────────────────────────── access_token ─────────────────────────────
@@ -136,9 +167,11 @@ public class QqBot {
         if (appId.isEmpty() || appSecret.isEmpty()) {
             throw new IllegalStateException("未配置 appid/appsecret，无法获取 access_token");
         }
+        // 注意：appId 必须作为【JSON 字符串】发送。若发成数字，QQ 会返回裸 400 且无响应体，
+        // 极难排查（实测 appId:"1905630086" → 200；appId:1905630086 → 400）。
         String body = gson.toJson(Map.of(
-                "appId", Long.parseLong(appId),
-                "clientSecret", appSecret,
+                "appId", appId.trim(),
+                "clientSecret", appSecret.trim(),
                 "grant_type", "client_credentials"));
         String respText = postText("https://bots.qq.com/app/getAppAccessToken", body, "application/json", null);
         JsonObject j = JsonParser.parseString(respText).getAsJsonObject();
@@ -194,20 +227,24 @@ public class QqBot {
         }
     }
 
-    /** 按事件类型分发。 */
+    /** 按事件类型分发（WebSocket 与 Webhook 两种模式共用）。 */
     private void dispatchEvent(String type, JsonObject event) {
-        if (type == null) { log("[Webhook] 忽略无类型事件"); return; }
+        if (type == null) { log("[事件] 忽略无类型事件"); return; }
         switch (type) {
             case "C2C_MESSAGE_CREATE":      handleC2c(event);      break;
             case "GROUP_AT_MESSAGE_CREATE": handleGroupAt(event);  break;
+            case "GROUP_ADD_ROBOT":         log("[事件] 机器人被加入群聊"); break;
+            case "GROUP_DEL_ROBOT":         log("[事件] 机器人被移出群聊"); break;
+            case "FRIEND_ADD":              log("[事件] 用户添加机器人"); break;
+            case "FRIEND_DEL":              log("[事件] 用户删除机器人"); break;
             case "GROUP_AND_C2C_EVENT":     /* 群/单聊事件，暂时忽略 */ break;
-            default: log("[Webhook] 忽略事件类型: " + type);
+            default: log("[事件] 忽略事件类型: " + type);
         }
     }
 
     private void handleC2c(JsonObject event) {
         JsonObject d = d(event);
-        String openid = opt(d, "author.user_openid");
+        String openid = optPath(d, "author.user_openid");
         if (openid == null) openid = opt(d, "user_openid");
         String content = opt(d, "content");
         if (openid == null || content == null) return;
@@ -219,15 +256,30 @@ public class QqBot {
     private void handleGroupAt(JsonObject event) {
         JsonObject d = d(event);
         String group = opt(d, "group_openid");
-        if (group == null) group = opt(d, "id.group_openid");
+        if (group == null) group = optPath(d, "id.group_openid");
         String content = opt(d, "content");
-        if (content == null) content = opt(d, "id.content");
+        if (content == null) content = optPath(d, "id.content");
         if (group == null || content == null) return;
         // 去掉 @机器人的 <@!123> 标记
         String clean = content.replaceAll("<@!?[0-9]+>", "").replaceAll("<@[^>]*>", "").trim();
         log("[群@] " + group + ": " + clean);
         String reply = runCommand(clean);
         sendGroup(group, reply);
+    }
+
+    /**
+     * 按点号路径读取嵌套字段（如 {@code author.user_openid}）。
+     * 任一层缺失或非对象时返回 null，不抛异常。
+     */
+    private static String optPath(JsonObject o, String path) {
+        if (o == null || path == null) return null;
+        String[] parts = path.split("\\.");
+        JsonObject cur = o;
+        for (int i = 0; i < parts.length - 1; i++) {
+            if (!cur.has(parts[i]) || !cur.get(parts[i]).isJsonObject()) return null;
+            cur = cur.getAsJsonObject(parts[i]);
+        }
+        return opt(cur, parts[parts.length - 1]);
     }
 
     /** 从事件 JSON 中提取 d 对象（兼容 t/d 分层与扁平两种）。 */
@@ -260,11 +312,87 @@ public class QqBot {
         Consumer<String> old = engine.getOutput();
         engine.setOutput(s -> { if (sb.length() > 0) sb.append("\n"); sb.append(s); });
         try {
-            engine.execute(line);
+            // QQ 侧增强命令优先处理；未命中则交给共享的 TaskEngine。
+            if (!qqCommand(line, sb)) {
+                engine.execute(line);
+            }
         } finally {
             engine.setOutput(old);
         }
         return sb.length() == 0 ? "（无输出）" : sb.toString();
+    }
+
+    /**
+     * QQ 侧增强命令：只处理 TaskEngine 不提供的查询/管理能力，
+     * 命中返回 true，未命中返回 false（交回 TaskEngine）。
+     */
+    private boolean qqCommand(String line, StringBuilder out) {
+        if (line == null) return false;
+        String[] tokens = line.trim().split("\\s+");
+        if (tokens.length == 0 || tokens[0].isEmpty()) return false;
+        String cmd = tokens[0].toLowerCase();
+        String[] argv = tokens.length > 1
+                ? java.util.Arrays.copyOfRange(tokens, 1, tokens.length) : new String[0];
+        switch (cmd) {
+            case "status":  out.append(statusText());            return true;
+            case "targets": out.append(targetsText(argv));       return true;
+            case "ping":    out.append("pong · 提醒目标 ")
+                                .append(remindTargets.size()).append(" 个"); return true;
+            default:        return false;
+        }
+    }
+
+    /** 组装运行状态：端口、提醒目标、未完成/已到期任务数。 */
+    private String statusText() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("【TaskMgr 状态】\n");
+        sb.append("Webhook 端口：").append(port).append('\n');
+        sb.append("提醒目标：").append(remindTargets.isEmpty() ? "（未配置）" : remindTargets).append('\n');
+        long now = System.currentTimeMillis();
+        String sql = "SELECT COUNT(*) AS total,"
+                + " SUM(CASE WHEN status != 'removed' THEN 1 ELSE 0 END) AS active,"
+                + " SUM(CASE WHEN status != 'removed' AND last_notified_at IS NULL AND ("
+                + "   (remind_at IS NOT NULL AND remind_at <= ?) OR (trigger_at IS NOT NULL AND trigger_at <= ?)"
+                + " ) THEN 1 ELSE 0 END) AS due"
+                + " FROM tasks";
+        try (Connection c = conn(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, now);
+            ps.setLong(2, now);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    sb.append("任务总数：").append(rs.getLong("total")).append('\n');
+                    sb.append("未删除：").append(rs.getLong("active")).append('\n');
+                    sb.append("待补发提醒：").append(rs.getLong("due"));
+                }
+            }
+        } catch (Exception e) {
+            sb.append("查询失败：").append(e.getMessage());
+        }
+        return sb.toString();
+    }
+
+    /** 查询/维护 QQ 推送目标：无参查询，set/clear 修改（仅内存，不落盘）。 */
+    private String targetsText(String[] argv) {
+        if (argv.length == 0 || "list".equalsIgnoreCase(argv[0])) {
+            return remindTargets.isEmpty()
+                    ? "提醒目标为空（请在 qqbot.properties 配置 remind.to）"
+                    : "提醒目标：" + remindTargets;
+        }
+        switch (argv[0].toLowerCase()) {
+            case "set":
+                if (argv.length < 2) return "用法：targets set group:<openid>[,user:<openid>…]";
+                remindTargets.clear();
+                for (String s : argv[1].split("[,;]")) {
+                    String t = s.trim();
+                    if (!t.isEmpty()) remindTargets.add(t);
+                }
+                return "提醒目标已更新：" + remindTargets;
+            case "clear":
+                remindTargets.clear();
+                return "提醒目标已清空（本次运行内生效）";
+            default:
+                return "未知子命令：" + argv[0] + "，可用 list|set|clear";
+        }
     }
 
     /** 发送单聊消息到用户 openid。 */
@@ -348,11 +476,8 @@ public class QqBot {
 
     /** 扫描到期任务并通知（幂等，避免重复）。 */
     private void checkReminders() {
-        String sql =
-            "SELECT id, title, note, trigger_type, priority, trigger_at, remind_at, last_notified_at " +
-            "FROM tasks WHERE status != 'removed' AND (" +
-            "  (remind_at IS NOT NULL AND remind_at <= ?) OR (trigger_at IS NOT NULL AND trigger_at <= ?)" +
-            ") ORDER BY priority DESC LIMIT 20";
+        // 使用 ReminderService 相同的SQL逻辑
+        String sql = "SELECT id,title,note,remind_at,last_notified_at FROM tasks WHERE status!='removed' AND ( (remind_at IS NOT NULL AND remind_at<=?) OR (trigger_at IS NOT NULL AND trigger_at<=?) )";
         long now = System.currentTimeMillis();
         try (Connection c = conn(); PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setLong(1, now);
@@ -362,16 +487,22 @@ public class QqBot {
                     String id = rs.getString("id");
                     String title = rs.getString("title");
                     String note = rs.getString("note");
-                    long lastNotified = rs.getLong("last_notified_at");
                     long remindAt = rs.getLong("remind_at");
-                    // 判定是否已通知过：距上次通知 < 5 分钟视为已通知（重启后仍能补弹一次）
-                    if (lastNotified > 0 && (now - lastNotified) < 5 * 60_000L) continue;
+                    long lastNotified = rs.getLong("last_notified_at");
+                    
+                    // 不重复判定：last_notified_at IS NULL = 该提醒尚未通知 → 补发
+                    // 已通知则跳过。这比"5分钟窗口"更贴合"重启补发且不重复"
+                    if (lastNotified != 0) {
+                        continue;
+                    }
+                    
                     String line = buildRemindText(title, note, remindAt);
                     // 本地弹窗 + 出声
                     localAlert(line);
                     // QQ 推送
                     pushToQQ(line);
-                    // 记时间戳，防止 10s 循环里反复触发
+                    
+                    // 触发后更新 last_notified_at，WHERE 保证并发下也只写一次
                     markNotified(c, id, now);
                 }
             }
@@ -411,16 +542,31 @@ public class QqBot {
     private void pushToQQ(String text) {
         if (remindTargets.isEmpty()) { log("[提醒] 未配置 remind.to，跳过 QQ 推送"); return; }
         for (String target : remindTargets) {
-            if (target.startsWith("group:")) sendGroup(target.substring("group:".length()), text);
-            else if (target.startsWith("user:")) sendC2c(target.substring("user:".length()), text);
-            else log("[提醒] 未知目标格式(需 group: 或 user: 前缀): " + target);
+            // 前缀分隔符容忍 : 与 . 两种写法（user:xxx / user.xxx），避免配置手误导致静默不推送
+            String kind, id;
+            int c = target.indexOf(':');
+            int dot = target.indexOf('.');
+            int sep = (c >= 0 && (dot < 0 || c < dot)) ? c : dot;
+            if (sep < 0) {
+                log("[提醒] 未知目标格式(需 user: 或 group: 前缀): " + target);
+                continue;
+            }
+            kind = target.substring(0, sep).trim().toLowerCase();
+            id = target.substring(sep + 1).trim();
+            if (id.isEmpty()) {
+                log("[提醒] 目标缺少 openid: " + target);
+                continue;
+            }
+            if ("group".equals(kind)) sendGroup(id, text);
+            else if ("user".equals(kind)) sendC2c(id, text);
+            else log("[提醒] 未知目标类型(需 user/group): " + target);
         }
     }
 
     /** 更新 last_notified_at，防止重复提醒。 */
     private void markNotified(Connection c, String id, long now) {
         try (PreparedStatement ps = c.prepareStatement(
-                "UPDATE tasks SET last_notified_at=? WHERE id=?")) {
+                "UPDATE tasks SET last_notified_at=? WHERE id=? AND last_notified_at IS NULL")) {
             ps.setLong(1, now);
             ps.setString(2, id);
             ps.executeUpdate();
