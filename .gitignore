@@ -23,8 +23,11 @@ buildNumber.properties
 *.iml
 
 # ---- Secrets ----
+# 注意：以下条目按“裸文件名”匹配任意目录，所以 src/main/resources/ 下的同名文件同样被忽略。
+# nlp.properties 与 qqbot.properties 都必须在此列出——缺一个就会泄漏密钥。
 config.properties
 qqbot.properties
+nlp.properties
 # Java
 *.class
 *.jar

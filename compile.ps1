@@ -3,6 +3,7 @@ $cp = "$env:USERPROFILE\.m2\repository\com\google\code\gson\gson\2.11.0\gson-2.1
 Remove-Item -Recurse -Force 'target\classes' -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force 'target\classes' | Out-Null
 Copy-Item 'src\main\resources\qqbot.properties' 'target\classes\' -Force
+Copy-Item 'src\main\resources\nlp.properties' 'target\classes\' -Force
 javac -encoding UTF-8 -cp $cp -d 'target\classes' `
   'src\main\java\Main.java' `
   'src\main\java\TaskEngine.java' `
@@ -16,5 +17,7 @@ javac -encoding UTF-8 -cp $cp -d 'target\classes' `
   'src\main\java\NlParser.java' `
   'src\main\java\NlParseException.java' `
   'src\main\java\ParsedTaskValidator.java' `
-  'src\main\java\ValidationException.java'
+  'src\main\java\ValidationException.java' `
+  'src\main\java\ProviderConfig.java' `
+  'src\main\java\CloudNlParser.java'
 Write-Output ("EXITCODE=" + $LASTEXITCODE)

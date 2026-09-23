@@ -91,6 +91,7 @@ public class TaskEngine {
             case "done":      handleSetStatus(argv, "done");    break;
             case "remove":    handleSetStatus(argv, "removed"); break;
             case "export":    handleExport(argv);      break;
+            case "nl":        handleNl(argv);    break;
             case "init":      handleInit();      break;
             case "help":
             case "?":         handleHelp(argv);  break;
@@ -299,6 +300,56 @@ public class TaskEngine {
         return new IcsExporter(conn).export(file);
     }
 
+    // ─────────────────────────── nl（S2 临时验证入口）───────────────────────────
+    /**
+     * nl &lt;一句话&gt; —— <b>临时验证入口（S2）</b>：把自然语言交给 AI 解析并打印结果。
+     * <p>
+     * ⚠️ <b>这是临时命令</b>：S3 把 AI 接进 {@code handleAdd} 之后，本命令应删除或保留为调试命令。
+     * <p>
+     * 边界（S2-7）：<b>只打印，不入库</b>，也完全不影响 {@code add} 的既有流程。
+     * 失败一律显式报错，不静默。
+     */
+    private void handleNl(String[] argv) {
+        if (argv.length == 0) {
+            out.accept("用法: nl <一句话>    例如: nl 下周三前交实验报告 大概4小时");
+            return;
+        }
+        String text = String.join(" ", argv);
+
+        ProviderConfig cfg = ProviderConfig.load();
+        if (cfg.isOff()) {
+            out.accept("[提示] AI 未启用（" + ProviderConfig.RESOURCE + " 里 mode=off），当前为规则解析模式。");
+            return;
+        }
+        CloudNlParser parser = new CloudNlParser(cfg, java.time.Clock.systemDefaultZone(), out::accept);
+        if (!parser.isConfigured()) {
+            out.accept("[提示] AI 配置不完整，请检查 " + ProviderConfig.RESOURCE
+                    + " （需要 baseurl / apikey / model）。当前: " + cfg);
+            return;
+        }
+
+        try {
+            ParsedTask parsed = parser.parse(text);
+            if (parsed == null) {
+                out.accept("[提示] AI 未能从这句话里解析出任务。");
+                return;
+            }
+            out.accept("[解析结果] " + parsed);
+            // 校验结果一并打印（校验器来自 S1，规则与本命令无关）
+            try {
+                new ParsedTaskValidator().validate(parsed);
+                out.accept("[校验] 通过");
+            } catch (ValidationException ve) {
+                out.accept("[校验] 未通过：" + ve.getMessage());
+            }
+            if (!parsed.hasTime()) {
+                out.accept("[注意] 未识别到时间，该任务不会有提醒。");
+            }
+        } catch (NlParseException e) {
+            out.accept("[错误] AI 解析失败：" + e.getMessage());
+        }
+    }
+
 // ─────────────────────────── list ───────────────────────────
     /** list —— 列出所有未删除任务。 */
     private void handleList(String[] argv) {
@@ -355,6 +406,7 @@ public class TaskEngine {
             + "  done [任务名]      —— 完成任务（留空=上次提醒的任务）\n"
             + "  remove [任务名]    —— 移除任务（留空=上次提醒的任务）\n"
             + "  export [文件]      —— 导出未来7天任务为 .ics（手机日历兜底）\n"
+            + "  nl <一句话>        —— [临时·S2] 用 AI 解析一句话并打印结果（不入库）\n"
             + "  init               —— 重建数据库表（危险）\n"
             + "  help | ?           —— 显示本帮助\n"
             + "\n-t / -a 触发时刻支持两种写法：\n"

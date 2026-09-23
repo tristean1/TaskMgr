@@ -1,0 +1,30 @@
+# ============================================
+# AI 自然语言解析 —— 配置模板
+# 复制为 nlp.properties 后填入你的服务商信息。
+# nlp.properties 已被 .gitignore 忽略，真实密钥不会入库。
+# ============================================
+
+# 模式：off = 不使用 AI（默认）；cloud = 云端 API；ollama = 本地（S7 预留）
+mode=off
+
+# 服务商标识（仅作日志显示，代码不依赖具体值）
+# 例：deepseek / zhipu / qwen / kimi / ollama
+provider=
+
+# API 基址（不含 /chat/completions）
+# 例：https://api.deepseek.com/v1
+baseurl=
+
+# API 密钥（Bearer Token）
+# 本地 Ollama 通常不需要，留空即可
+apikey=
+
+# 模型名
+# 例：deepseek-chat / glm-4-flash / qwen-turbo
+model=
+
+# 请求超时（秒）
+timeout=20
+
+# 是否打印原始返回（1=是，0=否）—— 排错时打开
+verbose=1
