@@ -68,6 +68,7 @@ javac -encoding UTF-8 --add-modules jdk.httpserver ^
   "%PROJ%\src\main\java\ReminderService.java" ^
   "%PROJ%\src\main\java\Autostart.java" ^
   "%PROJ%\src\main\java\ReminderMain.java" ^
+  "%PROJ%\src\main\java\IcsExporter.java" ^
   "%PROJ%\src\main\java\Main.java"
 
 if errorlevel 1 (

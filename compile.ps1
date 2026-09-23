@@ -11,5 +11,5 @@ javac -encoding UTF-8 -cp $cp -d 'target\classes' `
   'src\main\java\ReminderService.java' `
   'src\main\java\Autostart.java' `
   'src\main\java\ReminderMain.java' `
-  'src\main\java\Text.java'
+  'src\main\java\IcsExporter.java'
 Write-Output ("EXITCODE=" + $LASTEXITCODE)

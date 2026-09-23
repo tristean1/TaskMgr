@@ -90,6 +90,7 @@ public class TaskEngine {
             case "ls":        handleList(argv);  break;
             case "done":      handleSetStatus(argv, "done");    break;
             case "remove":    handleSetStatus(argv, "removed"); break;
+            case "export":    handleExport(argv);      break;
             case "init":      handleInit();      break;
             case "help":
             case "?":         handleHelp(argv);  break;
@@ -275,6 +276,29 @@ public class TaskEngine {
         }
     }
 
+    // ─────────────────────────── export ───────────────────────────
+    /** export [文件路径] —— 导出未来 7 天、未完成未删除的任务为 .ics 日历文件（手机兜底提醒）。 */
+    private void handleExport(String[] argv) {
+        try {
+            String file = (argv.length > 0) ? argv[0] : IcsExporter.DEFAULT_FILE;
+            int k = exportIcs(file);
+            out.accept("[OK] 已导出 " + k + " 条任务到: " + file
+                    + "（未来 7 天，已完成/已移除已排除）");
+        } catch (Exception e) {
+            out.accept("[错误] 导出失败: " + e.getMessage());
+        }
+    }
+
+    /** 供自动导出调用的入口（默认文件）。 */
+    public int exportIcs() throws Exception {
+        return exportIcs(IcsExporter.DEFAULT_FILE);
+    }
+
+    /** 导出到指定文件，返回事件条数。 */
+    public int exportIcs(String file) throws Exception {
+        return new IcsExporter(conn).export(file);
+    }
+
 // ─────────────────────────── list ───────────────────────────
     /** list —— 列出所有未删除任务。 */
     private void handleList(String[] argv) {
@@ -330,6 +354,7 @@ public class TaskEngine {
             + "  list | ls          —— 列出未删除任务\n"
             + "  done [任务名]      —— 完成任务（留空=上次提醒的任务）\n"
             + "  remove [任务名]    —— 移除任务（留空=上次提醒的任务）\n"
+            + "  export [文件]      —— 导出未来7天任务为 .ics（手机日历兜底）\n"
             + "  init               —— 重建数据库表（危险）\n"
             + "  help | ?           —— 显示本帮助\n"
             + "\n-t / -a 触发时刻支持两种写法：\n"

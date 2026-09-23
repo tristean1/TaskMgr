@@ -41,6 +41,18 @@ public class Main {
             // 启动提醒服务：先立刻补发一次, 之后每10秒
             ReminderService reminder = new ReminderService(conn);
             reminder.start(0, 10_000L);
+// 每日自动导出 .ics（手机兜底）：启动时先导一次，之后每 6 小时重导（幂等，容错覆盖“每天至少一次”）
+            java.util.concurrent.ScheduledExecutorService icsTimer =
+                    java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                        Thread t = new Thread(r, "ics-exporter");
+                        t.setDaemon(true);
+                        return t;
+                    });
+            icsTimer.scheduleWithFixedDelay(() -> {
+                try {
+                    engine.exportIcs();
+                } catch (Throwable ignored) { }
+            }, 0, 6 * 60 * 60 * 1000L, java.util.concurrent.TimeUnit.MILLISECONDS);
 
             // 用系统/控制台默认编码读取输入（Java 17 下默认编码跟随控制台代码页）
             Scanner sc = new Scanner(System.in);

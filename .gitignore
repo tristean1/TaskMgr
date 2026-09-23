@@ -15,6 +15,9 @@ buildNumber.properties
 *.db-wal
 *.db-shm
 
+# ---- Generated .ics export (auto-created by export / daily task) ----
+*.ics
+
 # ---- IDE ----
 .idea/
 *.iml
