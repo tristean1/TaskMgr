@@ -30,6 +30,8 @@ public class ProviderConfig {
     private String model = "";
     private int timeoutSeconds = 20;
     private boolean verbose = true;
+    /** 是否启用 AI 兜底（§2.2 的 auto 开关；默认开）。false = 退回纯规则解析。 */
+    private boolean auto = true;
 
     /** 从 classpath 的 nlp.properties 读取；文件缺失时使用默认值（AI 关闭）。 */
     public static ProviderConfig load() {
@@ -56,6 +58,9 @@ public class ProviderConfig {
         cfg.baseUrl = p.getProperty("baseurl", "").trim();
         cfg.apiKey = p.getProperty("apikey", "").trim();
         cfg.model = p.getProperty("model", "").trim();
+        // auto：1/true/on → true；缺省为 true（AI 兜底默认开）
+        String a = p.getProperty("auto", "1").trim().toLowerCase();
+        cfg.auto = !("0".equals(a) || "false".equals(a) || "off".equals(a));
         cfg.verbose = !"0".equals(p.getProperty("verbose", "1").trim());
         String t = p.getProperty("timeout", "20").trim();
         try {
@@ -149,6 +154,11 @@ public class ProviderConfig {
         return verbose;
     }
 
+    /** 是否启用 AI 兜底（§2.2 auto 开关）。 */
+    public boolean isAuto() {
+        return auto;
+    }
+
     public void setVerbose(boolean verbose) {
         this.verbose = verbose;
     }
@@ -161,6 +171,7 @@ public class ProviderConfig {
                 + ", baseUrl=" + baseUrl
                 + ", model=" + model
                 + ", apikey=" + (apiKey.isEmpty() ? "（未配置）" : "***已配置")
-                + ", timeout=" + timeoutSeconds + "s}";
+                + ", timeout=" + timeoutSeconds + "s"
+                + ", auto=" + auto + "}";
     }
 }

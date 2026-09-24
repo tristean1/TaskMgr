@@ -21,6 +21,9 @@ public class TaskEngine {
     /** 输出回调；默认打到标准输出。 */
     private Consumer<String> out = System.out::println;
 
+    /** 操作日志 + 撤销（S4）。在构造时初始化并注入任务名解析器。 */
+    private final OpLogKit opLog;
+
     private static final ZoneId ZONE = ZoneId.systemDefault();
 
     private static final String DDL_TASKS =
@@ -58,6 +61,8 @@ public class TaskEngine {
 
     public TaskEngine(Connection conn) {
         this.conn = conn;
+        this.opLog = new OpLogKit(conn);
+        this.opLog.setTitleLoader(this::titleOf);
         try {
             initSchema(conn);
         } catch (SQLException e) {
@@ -90,6 +95,7 @@ public class TaskEngine {
             case "ls":        handleList(argv);  break;
             case "done":      handleSetStatus(argv, "done");    break;
             case "remove":    handleSetStatus(argv, "removed"); break;
+            case "undo":      handleUndo();  break;
             case "export":    handleExport(argv);      break;
             case "nl":        handleNl(argv);    break;
             case "init":      handleInit();      break;
@@ -107,9 +113,11 @@ public class TaskEngine {
         String title = null;
         String note = null;
         String triggerType = "once";
-        int priority = 1;
+        Integer priority = null;     // null = 用户未指定 -p（§2.3 关键重构，别让默认值吞掉 AI 结果）
         Long triggerAt = null;
         Long remindAt = null;
+        boolean hasSharedT = false, hasSharedA = false, hasSharedP = false, hasSharedG = false;
+        boolean aiUsed = false;      // 回显时要标明是否为 AI 识别（R5）
 
         try {
             int i = 0;
@@ -122,24 +130,24 @@ public class TaskEngine {
                         break;
                     case "-p":
                         if (i + 1 >= argv.length) { out.accept("[错误] -p 需要数字"); return; }
-                        try { priority = Integer.parseInt(argv[++i]); }
+                        try { priority = Integer.parseInt(argv[++i]); hasSharedP = true; }
                         catch (NumberFormatException e) { out.accept("[错误] -p 需要整数，得到：" + argv[i]); return; }
                         break;
                     case "-g":
                         if (i + 1 >= argv.length) { out.accept("[错误] -g 需要触发类型"); return; }
-                        triggerType = argv[++i].toLowerCase();
+                        triggerType = argv[++i].toLowerCase(); hasSharedG = true;
                         break;
                     case "-t":
                         if (i + 1 >= argv.length) { out.accept("[错误] -t 需要触发时刻"); return; }
                         triggerAt = parseTimeToEpochMillis(collectTimeTokens(argv, i));
                         if (triggerAt == null) { out.accept("[提示] add 已放弃（时间无法解析）"); return; }
-                        i = consumeTimeTokens(argv, i);
+                        i = consumeTimeTokens(argv, i); hasSharedT = true;
                         break;
                     case "-a":
                         if (i + 1 >= argv.length) { out.accept("[错误] -a 需要提醒时刻"); return; }
                         remindAt = parseTimeToEpochMillis(collectTimeTokens(argv, i));
                         if (remindAt == null) { out.accept("[提示] add 已放弃（时间无法解析）"); return; }
-                        i = consumeTimeTokens(argv, i);
+                        i = consumeTimeTokens(argv, i); hasSharedA = true;
                         break;
                     default:
                         if (title == null) title = a; else title = title + " " + a;
@@ -159,7 +167,7 @@ public class TaskEngine {
             out.accept("[提示] 触发类型必须为 once / recurring / ongoing，得到: " + triggerType);
             return;
         }
-        if (priority < 1 || priority > 9) {
+        if (priority != null && (priority < 1 || priority > 9)) {
             out.accept("[提示] 优先级 priority 应为 1–9，得到: " + priority);
             return;
         }
@@ -167,20 +175,60 @@ public class TaskEngine {
             out.accept("[提示] 提醒时刻 -a 不能在触发时刻 -t 之后");
             return;
         }
-        // 同名校验：仅拦截未完成、未删除的任务；已 removed/done 的允许重名创建。
+
+        // ─── §2.1/§2.2 规则命中判定：出现 -t / -a → 规则解析成功，不调 AI ───
+        boolean ruleHit = (triggerAt != null || remindAt != null);
+        final String typedTitle = title;
+        Integer estimate = null;
+
+        if (!ruleHit && shouldUseAi(typedTitle)) {
+            // 自然语言 = 非开关部分（标题本身）。用显式开关覆盖 AI 结果（§1.2）。
+            ParsedTask ai = tryAiFallback(typedTitle);
+            if (ai != null) {
+                aiUsed = true;
+                if (ai.getTitle() != null && !ai.getTitle().trim().isEmpty()) title = ai.getTitle().trim();
+                if (note == null && ai.getNote() != null) note = ai.getNote();
+                if (!hasSharedT && triggerAt == null && ai.getDueAt() != null) triggerAt = ai.getDueAt();
+                if (!hasSharedA && remindAt == null && ai.getRemindAt() != null) remindAt = ai.getRemindAt();
+                if (!hasSharedP && priority == null && ai.getPriority() != null) priority = ai.getPriority();
+                // estimate 无显式开关，直接用 AI 的（§2.3）
+                if (estimate == null && ai.getEstimateMinutes() != null) estimate = ai.getEstimateMinutes();
+            }
+        }
+
+        // ─── 同名校验：最终标题（可能是 AI 识别出的标题）───
         if (hasActiveTask(title)) {
             out.accept("[提示] 已存在同名任务: \"" + title + "\"，请先 done/remove 后再添加");
             return;
         }
-        addTask(title, note, triggerType, priority, triggerAt, remindAt);
-        out.accept("[OK] 已添加: \"" + title + "\" (priority=" + priority + ", type=" + triggerType + ")"
-                + (triggerAt != null ? ", 触发=" + fmtEpoch(triggerAt) : ", 无触发时刻")
-                + (remindAt != null ? ", 提醒=" + fmtEpoch(remindAt) : ""));
+
+        int finalPriority = (priority == null) ? 1 : priority;
+
+        // effect: validate final merged values（AI 路径才需要；规则路径已有手工校验）
+        ParsedTask finalParsed = new ParsedTask(title, triggerAt, remindAt,
+                estimate, finalPriority, note);
+        try {
+            new ParsedTaskValidator().validate(finalParsed);
+        } catch (ValidationException ve) {
+            out.accept("[提示] " + ve.getMessage());
+            return; // 校验失败不入库（§2.1 步骤⑦）
+        }
+
+        triggerAt = finalParsed.getDueAt();
+        remindAt = finalParsed.getRemindAt();
+        priority = finalParsed.getPriority();
+
+        String newId = addTask(title, note, triggerType, finalPriority, triggerAt, remindAt, estimate);
+        if (newId == null) return; // 插入失败，addTask 已报错
+
+        echoAdd(newId, title, finalPriority, triggerAt, remindAt, estimate, aiUsed);
         handleList(new String[0]);
     }
 // ─────────────────────────── add 的插入助手 ───────────────────────────
-    private void addTask(String title, String note, String triggerType, int priority,
-                         Long triggerAt, Long remindAt) {
+    /** 插入任务，返回新任务 id；失败返回 null（已在内部报错）。同时记录 op_log（S4）。 */
+    private String addTask(String title, String note, String triggerType, int priority,
+                           Long triggerAt, Long remindAt, Integer estimate) {
+        String id = UUID.randomUUID().toString();
         String sql = "INSERT INTO tasks(" +
                 "id,title,note,trigger_type,status,priority," +
                 "trigger_at,remind_at,estimate_minutes," +
@@ -189,7 +237,7 @@ public class TaskEngine {
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
         long now = Instant.now().toEpochMilli();
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, UUID.randomUUID().toString());
+            ps.setString(1, id);
             ps.setString(2, title);
             if (note != null) ps.setString(3, note); else ps.setNull(3, Types.VARCHAR);
             ps.setString(4, triggerType);
@@ -197,7 +245,7 @@ public class TaskEngine {
             ps.setInt(6, priority);
             if (triggerAt != null) ps.setLong(7, triggerAt); else ps.setNull(7, Types.INTEGER);
             if (remindAt != null) ps.setLong(8, remindAt); else ps.setNull(8, Types.INTEGER);
-            ps.setNull(9, Types.INTEGER);
+            if (estimate != null) ps.setLong(9, estimate); else ps.setNull(9, Types.INTEGER);
             ps.setNull(10, Types.VARCHAR);
             ps.setNull(11, Types.INTEGER);
             ps.setNull(12, Types.VARCHAR);
@@ -208,6 +256,136 @@ public class TaskEngine {
             ps.executeUpdate();
         } catch (SQLException e) {
             out.accept("[错误] 插入任务失败: " + e.getMessage());
+            return null;
+        }
+        // §3.5：add 必须进 op_log（含 AI 添加的路径），错误也能撤销
+        opLog.recordAdd(id, rowToJson(id));
+        return id;
+    }
+// ─────────────────────────── S3：AI 兜底 + 回显 ───────────────────────────
+    /**
+     * §2.2 时间关键词判定：标题是否「疑似时间相关」→ 规则未命中时该调 AI。
+     * <p>宁可宽、不可窄：误判只多调一次 AI（多花几分钱），漏判则用户以为设了提醒
+     * 实际没有 —— 那才是信任断裂。下表是「最小集」，可扩充。
+     */
+    private boolean shouldUseAi(String title) {
+        if (title == null || title.trim().isEmpty()) return false;
+        String[] kw = {"今天", "明天", "后天", "今晚", "明早", "明晚",
+                "早上", "上午", "中午", "下午", "晚上",
+                "周一", "周二", "周三", "周四", "周五", "周六", "周日", "周天",
+                "星期", "下周", "本周", "这周", "上周",
+                "每月", "每天", "每周", "每年",
+                "月", "号", "日", "点", "时", "分", "前", "后", "内", "底", "初",
+                "+1", "+2", "+3", "+4", "+5", "+6", "+7",
+                "T+"};
+        for (String k : kw) {
+            if (title.contains(k)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * S3 核心：规则未命中时调 AI 解析「非开关部分」。
+     * <p>按 §2.5：返回 {@code ParsedTask}（成功）或 null；真正的调用失败（网络/格式）
+     * 在此处降级为「按原标题入库、无时间」思路由调用方接手——本方法只负责「成功拿到解析」。
+     * <ul>
+     *   <li>AI 未启用/未配置 → 明确提示，返回 null（由上层决定是否降级）；</li>
+     *   <li>{@code parse} 返回 null（模型说不懂）→ 提示 + 返回 null（上层按标题入库并警告）；</li>
+     *   <li>{@code parse} 抛异常（网络等）→ 报告原因，返回 null（上层按标题入库并警告）。</li>
+     * </ul>
+     */
+    private ParsedTask tryAiFallback(String text) {
+        ProviderConfig cfg = ProviderConfig.load();
+        // §2.2 的 auto 开关：0/false/off → 退回纯规则解析，完全不调 AI
+        if (!cfg.isAuto()) {
+            return null;
+        }
+        CloudNlParser parser = new CloudNlParser(cfg, java.time.Clock.systemDefaultZone(), out::accept);
+        if (!parser.isConfigured()) {
+            out.accept("[提示] AI 未配置完整（需要 baseurl / apikey / model），请检查 "
+                    + ProviderConfig.RESOURCE + "；将按无时间任务入库，或用 -t 手动指定。");
+            return null;
+        }
+        try {
+            ParsedTask parsed = parser.parse(text);
+            if (parsed == null) {
+                out.accept("[提示] AI 没能从这句话里解析出任务，将按原标题入库（无时间）。");
+                return null;
+            }
+            return parsed;
+        } catch (NlParseException e) {
+            out.accept("[错误] AI 解析失败：" + e.getMessage() + "。将按原标题降级入库（无时间）。");
+            return null;
+        }
+    }
+
+    /** S3 权威回显（§2.4 R1–R5）：必须写明具体时间、提示 undo、无时间时显式警告、标明是否 AI。 */
+    private void echoAdd(String id, String title, int priority, Long triggerAt,
+                         Long remindAt, Integer estimate, boolean aiUsed) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("[OK] 已添加：").append(title);
+        if (aiUsed) sb.append("  （AI 识别）");
+        sb.append("\n");
+        boolean hasTime = (triggerAt != null || remindAt != null);
+        if (hasTime) {
+            sb.append("     DDL ").append(fmtEpoch(triggerAt != null ? triggerAt : remindAt));
+            if (estimate != null) sb.append(" ｜ 预估 ").append(estimate).append(" 分钟");
+            if (priority > 0) sb.append(" ｜ 优先级 ").append(priority);
+            if (remindAt != null) sb.append(" ｜ 提醒 ").append(fmtEpoch(remindAt));
+        } else {
+            sb.append("     ⚠️ 未识别到时间，该任务不会有提醒");   // R4：无时间必须显式说明
+            if (priority > 0) sb.append(" ｜ 优先级 ").append(priority);
+        }
+        sb.append("\n     （").append(aiUsed ? "AI 识别" : "已添加").append("，错了发 undo 撤销）"); // R2
+        out.accept(sb.toString());
+    }
+
+    // ─────────────────────────── S4：undo ───────────────────────────
+    /** undo —— 撤销最近一条未撤销的操作（add/remove/done；不含 init）。 */
+    private void handleUndo() {
+        String r = opLog.undo();
+        if (r == null) {
+            out.accept("[提示] 没有可撤销的操作。");
+        } else {
+            out.accept(r);
+        }
+    }
+
+    // ─────────────────────────── 行 → JSON 快照 ───────────────────────────
+    /** 把 tasks 表一行转成 JSON 字符串（用 gson），供 op_log 快照。 */
+    private String rowToJson(String id) {
+        String sql = "SELECT * FROM tasks WHERE id=?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return "{}";
+                com.google.gson.JsonObject o = new com.google.gson.JsonObject();
+                java.sql.ResultSetMetaData md = rs.getMetaData();
+                for (int c = 1; c <= md.getColumnCount(); c++) {
+                    String col = md.getColumnName(c);
+                    Object v = rs.getObject(c);
+                    if (v == null) { o.add(col, com.google.gson.JsonNull.INSTANCE); }
+                    else if (v instanceof Number) { o.addProperty(col, (Number) v); }
+                    else if (v instanceof Boolean) { o.addProperty(col, (Boolean) v); }
+                    else { o.addProperty(col, v.toString()); }
+                }
+                return o.toString();
+            }
+        } catch (SQLException e) {
+            return "{ \"id\": \"" + id + "\", \"error\": \"snapshot failed\" }";
+        }
+    }
+
+    /** task_id → 任务名（undo 回显用）。 */
+    private String titleOf(String id) {
+        String sql = "SELECT title FROM tasks WHERE id=?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString("title") : null;
+            }
+        } catch (SQLException e) {
+            return null;
         }
     }
 // ─────────────────────────── done / remove ───────────────────────────
@@ -250,6 +428,7 @@ public class TaskEngine {
             }
 
             long now = Instant.now().toEpochMilli();
+            String beforeJson = rowToJson(id);
             String u = "UPDATE tasks SET status=?, done_at=?, updated_at=? WHERE id=?";
             try (PreparedStatement ps = conn.prepareStatement(u)) {
                 ps.setString(1, newStatus);
@@ -258,6 +437,8 @@ public class TaskEngine {
                 ps.setString(4, id);
                 ps.executeUpdate();
             }
+            // S4：remove / done 记录前后快照，供撤销
+            opLog.recordStatusChange(id, newStatus, beforeJson, rowToJson(id));
             out.accept("[OK] 任务已设为 " + newStatus + ": \"" + title + "\"");
         } catch (SQLException e) {
             out.accept("[错误] " + newStatus + " 失败: " + e.getMessage());
@@ -387,6 +568,7 @@ public class TaskEngine {
     private void handleInit() {
         try {
             try (Statement st = conn.createStatement()) {
+                st.execute("DROP TABLE IF EXISTS op_log;");
                 st.execute("DROP TABLE IF EXISTS task_note;");
                 st.execute("DROP TABLE IF EXISTS tasks;");
                 st.execute("DROP TABLE IF EXISTS meta;");
@@ -405,6 +587,7 @@ public class TaskEngine {
             + "  list | ls          —— 列出未删除任务\n"
             + "  done [任务名]      —— 完成任务（留空=上次提醒的任务）\n"
             + "  remove [任务名]    —— 移除任务（留空=上次提醒的任务）\n"
+            + "  undo               —— 撤销最近一次 add/remove/done（安全网，重启后仍有效）\n"
             + "  export [文件]      —— 导出未来7天任务为 .ics（手机日历兜底）\n"
             + "  nl <一句话>        —— [临时·S2] 用 AI 解析一句话并打印结果（不入库）\n"
             + "  init               —— 重建数据库表（危险）\n"
@@ -422,6 +605,9 @@ public class TaskEngine {
             st.execute("CREATE INDEX IF NOT EXISTS idx_tasks_next ON tasks(next_trigger_at);");
             st.execute(DDL_TASK_NOTE);
             st.execute(DDL_META);
+            // S4：op_log 平滑补表（旧库自动建，无需 init），供 undo 安全网
+            st.execute(OpLogKit.DDL_OP_LOG);
+            st.execute(OpLogKit.IDX_OP_LOG);
         }
         try (PreparedStatement ps = conn.prepareStatement(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '2')")) {
