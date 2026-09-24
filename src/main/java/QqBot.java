@@ -64,9 +64,12 @@ public class QqBot {
     public static void main(String[] args) throws Exception {
         // BUG-001：单实例保护。必须放在最前面——双实例会导致 QQ 侧互相踢连接、疯狂重连、
         // 消息被处理两次（详见 SingleInstanceLock 类注释）。
-        SingleInstanceLock lock = SingleInstanceLock.acquire("qqbot");
+        SingleInstanceLock lock = SingleInstanceLock.acquire("qqbot", "QqBot.main");
         if (lock == null) {
             System.err.println("[QQBot] 已有另一个 QqBot 实例在运行，本次启动已取消（避免双实例互踢连接）。");
+            System.err.println("        当前锁持有者：");
+            System.err.println("        " + SingleInstanceLock.describeHolder("qqbot")
+                    .replace(System.lineSeparator(), System.lineSeparator() + "        "));
             System.err.println("        如确认没有实例在跑，请删除锁文件后重试：");
             System.err.println("        " + new java.io.File(System.getProperty("user.home")
                     + java.io.File.separator + ".taskmgr" + java.io.File.separator + "qqbot.lock"));

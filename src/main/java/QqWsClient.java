@@ -124,6 +124,17 @@ public class QqWsClient {
     // ───────────────────────── 单次连接 ─────────────────────────
 
     private void connectOnce() throws Exception {
+        // BUG-003：本次连接的"代号"。关闭信号按代号绑定，旧连接的信号不会误唤醒新连接。
+        final long myGen = ++connectionGeneration;
+
+        // BUG-003 改法 B：建新连接前先彻底清理上一条（防御性保险，杜绝两条同时存活）。
+        WebSocket old = this.ws;
+        if (old != null) {
+            log("[WS] 建新连接前发现旧连接对象未清理，强制断开（代数 " + (myGen - 1) + "）");
+            try { old.abort(); } catch (Throwable ignore) {}
+            this.ws = null;
+        }
+
         String url;
         if (resumeGatewayUrl != null) {
             url = resumeGatewayUrl;             // Resume 必须用同一网关
@@ -131,22 +142,32 @@ public class QqWsClient {
             url = fetchGatewayUrl();
             resumeGatewayUrl = url;             // 记录，供后续 Resume 复用
         }
-        log("[WS] 正在连接 " + url + (sessionId != null ? "（带 session 恢复）" : "（全新登录）"));
+        log("[WS] 正在连接 " + url + (sessionId != null ? "（带 session 恢复）" : "（全新登录）")
+                + "（代数 " + myGen + "）");
 
         // identify/resume 成功（READY/RESUMED）之前不重置，失败时保留退避
-        WebSocket.Listener listener = new Listener();
+        WebSocket.Listener listener = new Listener(myGen);
         WebSocket socket = http.newWebSocketBuilder()
                 .connectTimeout(java.time.Duration.ofSeconds(20))
                 .buildAsync(URI.create(url), listener)
                 .join(); // 等待握手完成；失败抛 CompletionException
+
+        // BUG-003 改法 C：唯一性自检——此处本应为 null；若不为 null 说明仍有并存连接。
+        if (this.ws != null) {
+            log("[WS] 告警：建连后仍存在旧连接对象，强制关闭（BUG-003 防御性检查）");
+            try { this.ws.abort(); } catch (Throwable ignore) {}
+        }
         this.ws = socket;
 
         // 后续动作（Identify / 心跳）由 Listener 收到 OP 10 Hello 后驱动，
         // 因为必须等 Hello 才知道 heartbeat_interval。
-        awaitClose();
+        awaitClose(myGen);
 
-        // 连接结束后清空引用，避免心跳线程往已关闭的连接写数据
-        this.ws = null;
+        // 连接结束后清空引用，避免心跳线程往已关闭的连接写数据。
+        // 只有仍是本次连接时才清空，避免误清掉更新一代的连接。
+        if (myGen == connectionGeneration) {
+            this.ws = null;
+        }
     }
 
     /** 拉取通用网关地址。 */
@@ -171,29 +192,28 @@ public class QqWsClient {
         return url;
     }
 
-    /** 等待连接结束（Listener 内部在 onClose/onError 时释放）。 */
-    private void awaitClose() {
-        Object lock = closeLock;
-        synchronized (lock) {
-            while (!connectionFinished) {
+    /** 等待"属于本次连接代号"的关闭信号（BUG-003：信号按代绑定，旧信号不会误唤醒新连接）。 */
+    private void awaitClose(long myGen) {
+        synchronized (closeLock) {
+            while (finishedGen < myGen) {
                 try {
-                    lock.wait(5_000L);
+                    closeLock.wait(5_000L);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
                 }
                 if (closed.get()) return;
             }
-            connectionFinished = false;
         }
     }
 
     private final Object closeLock = new Object();
-    private boolean connectionFinished = false;
+    /** 已收到关闭信号的最大连接代号。单调递增、永不复位，避免"复位丢失"竞态。 */
+    private long finishedGen = 0;
 
-    private void signalClosed() {
+    private void signalClosed(long gen) {
         synchronized (closeLock) {
-            connectionFinished = true;
+            if (gen > finishedGen) finishedGen = gen;
             closeLock.notifyAll();
         }
     }
@@ -251,9 +271,12 @@ public class QqWsClient {
         log("[WS] 已发送 Resume（seq=" + (hasSeq ? lastSeq.get() : 0) + "）");
     }
 
-    private void startHeartbeat() {
+    private synchronized void startHeartbeat(long gen) {
+        if (gen != connectionGeneration) {
+            log("[WS] 忽略过期连接的心跳启动（代数 " + gen + "）");
+            return;
+        }
         stopHeartbeat();
-        final long gen = ++connectionGeneration;
         heartbeatTimer = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "qqbot-ws-heartbeat");
             t.setDaemon(true);
@@ -278,17 +301,23 @@ public class QqWsClient {
         log("[WS] 心跳已启动，实际周期 " + period + "ms（服务端要求 " + heartbeatIntervalMs + "ms）");
     }
 
-    /** 连接代号：每次 startHeartbeat 自增，用于作废旧定时器。 */
+    /** 连接代号：每次 connectOnce 真正建连前自增；用于作废旧心跳定时器、丢弃过期连接帧。 */
     private volatile long connectionGeneration = 0;
     /** 是否打印每次心跳（排查 4009 超时时打开）。 */
     private volatile boolean verboseHeartbeat = true;
 
-    private void stopHeartbeat() {
+    private synchronized void stopHeartbeat() {
         ScheduledExecutorService t = heartbeatTimer;
         if (t != null) {
             t.shutdownNow();
             heartbeatTimer = null;
         }
+    }
+
+    /** 仅当该连接仍是当前连接时才停心跳，避免旧连接的 onClose 误停新连接的心跳（BUG-003）。 */
+    private synchronized void stopHeartbeatIfCurrent(long gen) {
+        if (gen != connectionGeneration) return;
+        stopHeartbeat();
     }
 
     private void sleep(long ms) {
@@ -311,11 +340,19 @@ public class QqWsClient {
      * 因此所有回包动作都丢到独立线程执行。
      */
     private class Listener implements WebSocket.Listener {
+        private final long myGen;
         private final StringBuilder buf = new StringBuilder();
+        /** 本连接对应的 WebSocket；op7 主动关闭时使用，避免误操作新连接。 */
+        private volatile WebSocket self;
+
+        Listener(long myGen) {
+            this.myGen = myGen;
+        }
 
         @Override
         public void onOpen(WebSocket webSocket) {
-            log("[WS] 连接已建立，等待 Hello…");
+            this.self = webSocket;
+            log("[WS] 连接已建立，等待 Hello…（代数 " + myGen + "）");
             webSocket.request(1);
         }
 
@@ -347,8 +384,16 @@ public class QqWsClient {
 
         @Override
         public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-            log("[WS] 连接关闭 code=" + statusCode + " reason=" + reason + describeCode(statusCode));
-            stopHeartbeat();
+            log("[WS] 连接关闭 code=" + statusCode + " reason=" + reason
+                    + describeCode(statusCode) + "（代数 " + myGen + "）");
+            stopHeartbeatIfCurrent(myGen);
+
+            // BUG-003：已被新连接取代的旧连接，其关闭不得影响当前会话状态
+            if (myGen != connectionGeneration) {
+                signalClosed(myGen);
+                return null;
+            }
+
             if (statusCode == 4914 || statusCode == 4915) {
                 // 已下架/封禁，重连无意义
                 log("[WS] 机器人已下架或封禁，停止重连");
@@ -364,6 +409,17 @@ public class QqWsClient {
                     hasSeq = false;
                     resumeFailures = 0;
                 }
+            } else if (statusCode == 1006 || statusCode == 1005 || statusCode == 1001) {
+                // P2：网络层异常断开（1006 等）不立刻清 session —— 先尝试 Resume，
+                // 会话可跨较长时间补发遗漏事件（§12.12 实测可跨 3 小时）；连续多次仍未恢复再全新登录。
+                resumeFailures++;
+                if (resumeFailures >= 3) {
+                    log("[WS] 网络异常连续 " + resumeFailures + " 次仍未恢复，改为全新 Identify");
+                    sessionId = null;
+                    resumeGatewayUrl = null;
+                    hasSeq = false;
+                    resumeFailures = 0;
+                }
             } else if (statusCode != WebSocket.NORMAL_CLOSURE) {
                 // 会话无效，下次全新登录
                 sessionId = null;
@@ -371,19 +427,23 @@ public class QqWsClient {
                 hasSeq = false;
                 resumeFailures = 0;
             }
-            signalClosed();
+            signalClosed(myGen);
             return null;
         }
 
         @Override
         public void onError(WebSocket webSocket, Throwable error) {
-            log("[WS] 连接错误: " + error);
-            stopHeartbeat();
-            signalClosed();
+            log("[WS] 连接错误（代数 " + myGen + "）: " + error);
+            stopHeartbeatIfCurrent(myGen);
+            signalClosed(myGen);
         }
 
         /** 按 opcode 分发。 */
         private void handleFrame(String text) throws Exception {
+            // BUG-003：过期连接的帧一律丢弃，避免旧连接的 Hello 在新连接上触发重复 Resume/Identify
+            if (myGen != connectionGeneration) {
+                return;
+            }
             JsonObject msg = JsonParser.parseString(text).getAsJsonObject();
             int op = msg.has("op") ? msg.get("op").getAsInt() : -1;
             switch (op) {
@@ -400,7 +460,7 @@ public class QqWsClient {
                     } else {
                         sendIdentify();
                     }
-                    startHeartbeat();
+                    startHeartbeat(myGen);
                     break;
                 }
                 case 11: // Heartbeat ACK
@@ -426,11 +486,13 @@ public class QqWsClient {
                                 ? msg.getAsJsonObject("d") : new JsonObject();
                         if (d.has("session_id")) sessionId = d.get("session_id").getAsString();
                         reconnectAttempt = 0; // 登录成功，重置退避
+                        resumeFailures = 0;   // 登录成功即视为 Resume 链路正常
                         log("[WS] 鉴权成功 READY，session_id=" + sessionId);
                         break;
                     }
                     if ("RESUMED".equals(t)) {
                         reconnectAttempt = 0;
+                        resumeFailures = 0;   // Resume 成功，清零失败计数
                         log("[WS] 会话已恢复 RESUMED");
                         break;
                     }
@@ -445,8 +507,14 @@ public class QqWsClient {
                     break;
                 }
                 case 7: // Reconnect：服务端要求重连（可 Resume）
-                    log("[WS] 服务端要求重连");
-                    signalClosed();
+                    log("[WS] 服务端要求重连（代数 " + myGen + "），主动关闭当前连接");
+                    // BUG-003：不能只置标志就返回——那样旧连接还活着，会与新连接并存。
+                    // 主动断开（触发 onClose/onError 回调）并补发一次本代信号，保证 awaitClose 不会永久等待。
+                    WebSocket sock = self;
+                    if (sock != null) {
+                        try { sock.abort(); } catch (Throwable ex) { log("[WS] 主动断开失败: " + ex.getMessage()); }
+                    }
+                    signalClosed(myGen);
                     break;
                 case 9: // Invalid Session：需重新 Identify
                     log("[WS] 会话无效，将重新登录");

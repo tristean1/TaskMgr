@@ -152,6 +152,8 @@ public class Main {
                 System.out.println(qqBot != null && qqBot.isUp()
                         ? "QQ 消息功能: 已开启"
                         : "QQ 消息功能: 已关闭");
+                System.out.println("单实例锁(qqbot): " + System.lineSeparator()
+                        + SingleInstanceLock.describeHolder("qqbot"));
                 break;
             default:
                 System.out.println("未知子命令: " + subcmd + "，可用: up|down|status");
@@ -160,18 +162,26 @@ public class Main {
 
     /** qqbot up：懒初始化机器人并开启消息收发，同时挂上提醒推送回调。 */
     private static void qqbotUp(ReminderService reminder) {
+        // 同一进程内重复 qqbot up：直接提示，避免又去抢锁（同 JVM 抢锁会拿到 null 而误报"别的实例"）。
+        if (qqBot != null && qqBot.isUp()) {
+            System.out.println("[QQBot] 消息功能已在运行（如需重开请先 qqbot down）");
+            return;
+        }
         // BUG-001：跨进程单实例保护。本进程内的 qqBot != null 只能防"同一进程连点两次"，
         // 防不住"另一个 JVM 也在跑 QqBot"——那才是实测中导致连接互踢的元凶。
         SingleInstanceLock lock = null;
         try {
-            lock = SingleInstanceLock.acquire("qqbot");
+            lock = SingleInstanceLock.acquire("qqbot", "Main(qqbot up)");
         } catch (Exception e) {
             System.out.println("[QQBot] 单实例锁创建失败: " + e.getMessage());
             return;
         }
         if (lock == null) {
             System.out.println("[QQBot] 已有另一个 QqBot 实例在运行，本次开启已取消。");
-            System.out.println("        若确认没有实例在跑，请删除 ~/.taskmgr/qqbot.lock 后重试。");
+            System.out.println("        当前锁持有者：");
+            System.out.println("        " + SingleInstanceLock.describeHolder("qqbot")
+                    .replace(System.lineSeparator(), System.lineSeparator() + "        "));
+            System.out.println("        若确认没有实例在跑，可删除 ~/.taskmgr/qqbot.lock 后重试。");
             return;
         }
 

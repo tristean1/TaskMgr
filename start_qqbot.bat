@@ -62,14 +62,7 @@ copy /Y "%CONF%" "%OUT%\qqbot.properties" >nul
 javac -encoding UTF-8 --add-modules jdk.httpserver ^
   -cp "%GSON%;%SQLITE%;%SLF4J%" ^
   -d "%OUT%" ^
-  "%PROJ%\src\main\java\QqBot.java" ^
-  "%PROJ%\src\main\java\QqWsClient.java" ^
-  "%PROJ%\src\main\java\TaskEngine.java" ^
-  "%PROJ%\src\main\java\ReminderService.java" ^
-  "%PROJ%\src\main\java\Autostart.java" ^
-  "%PROJ%\src\main\java\ReminderMain.java" ^
-  "%PROJ%\src\main\java\IcsExporter.java" ^
-  "%PROJ%\src\main\java\Main.java"
+  "%PROJ%\src\main\java\*.java"
 
 if errorlevel 1 (
     echo [错误] 编译失败，请看上面的 javac 报错。
