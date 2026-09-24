@@ -62,6 +62,25 @@ public class QqBot {
 
     // ───────────────────────────── 主入口 ─────────────────────────────
     public static void main(String[] args) throws Exception {
+        // BUG-001：单实例保护。必须放在最前面——双实例会导致 QQ 侧互相踢连接、疯狂重连、
+        // 消息被处理两次（详见 SingleInstanceLock 类注释）。
+        SingleInstanceLock lock = SingleInstanceLock.acquire("qqbot");
+        if (lock == null) {
+            System.err.println("[QQBot] 已有另一个 QqBot 实例在运行，本次启动已取消（避免双实例互踢连接）。");
+            System.err.println("        如确认没有实例在跑，请删除锁文件后重试：");
+            System.err.println("        " + new java.io.File(System.getProperty("user.home")
+                    + java.io.File.separator + ".taskmgr" + java.io.File.separator + "qqbot.lock"));
+            return;
+        }
+        try {
+            runBot();
+        } finally {
+            lock.release();
+        }
+    }
+
+    /** QqBot 的实际启动逻辑（由 {@link #main} 在取得单实例锁后调用）。 */
+    private static void runBot() throws Exception {
         Class.forName("org.sqlite.JDBC");
         String dbPath = System.getProperty("user.home") + File.separator + ".taskmgr"
                 + File.separator + "tasks.db";

@@ -15,6 +15,8 @@ public class Main {
     private static QqBot qqBot;
     /** qqbot 使用的独立数据库连接（与主循环连接分离，避免线程并发复用）。 */
     private static Connection qqConn;
+    /** BUG-001：QQ 机器人运行期间持有的跨进程单实例锁，qqbot down 时释放。 */
+    private static SingleInstanceLock qqLock;
 
     private static String dbPath() {
         return System.getProperty("user.home")
@@ -158,6 +160,21 @@ public class Main {
 
     /** qqbot up：懒初始化机器人并开启消息收发，同时挂上提醒推送回调。 */
     private static void qqbotUp(ReminderService reminder) {
+        // BUG-001：跨进程单实例保护。本进程内的 qqBot != null 只能防"同一进程连点两次"，
+        // 防不住"另一个 JVM 也在跑 QqBot"——那才是实测中导致连接互踢的元凶。
+        SingleInstanceLock lock = null;
+        try {
+            lock = SingleInstanceLock.acquire("qqbot");
+        } catch (Exception e) {
+            System.out.println("[QQBot] 单实例锁创建失败: " + e.getMessage());
+            return;
+        }
+        if (lock == null) {
+            System.out.println("[QQBot] 已有另一个 QqBot 实例在运行，本次开启已取消。");
+            System.out.println("        若确认没有实例在跑，请删除 ~/.taskmgr/qqbot.lock 后重试。");
+            return;
+        }
+
         if (qqBot == null) {
             try {
                 Class.forName("org.sqlite.JDBC");
@@ -167,19 +184,24 @@ public class Main {
                 qqBot.loadConfig();
             } catch (Exception e) {
                 System.out.println("[QQBot] 初始化失败: " + e.getMessage());
+                lock.release();
                 return;
             }
         }
         if (qqBot.isUp()) {
             System.out.println("[QQBot] 消息功能已在运行");
+            lock.release();   // 已在运行 → 归还锁，避免自己占着不放
             return;
         }
         try {
             qqBot.startMessaging();
             reminder.setOnTaskRemind(qqBot::pushRemind);
+            // 锁交由本进程持有，直到 qqbotDown 释放
+            qqLock = lock;
             System.out.println("[QQBot] 已开启，并已接入到期提醒的 QQ 推送");
         } catch (Exception e) {
             System.out.println("[QQBot] 启动失败: " + e.getMessage());
+            lock.release();
         }
     }
 
@@ -190,6 +212,11 @@ public class Main {
             qqBot.stopMessaging();
         } else {
             System.out.println("[QQBot] 消息收发本就处于关闭状态");
+        }
+        // BUG-001：关闭时归还单实例锁，让其他启动方式能接管
+        if (qqLock != null) {
+            qqLock.release();
+            qqLock = null;
         }
     }
 }
