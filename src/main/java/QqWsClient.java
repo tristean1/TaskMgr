@@ -284,25 +284,60 @@ public class QqWsClient {
         });
         // 官方建议：心跳周期取 heartbeat_interval，实际发送略提前以免边界抖动被判超时
         long period = Math.max(5_000L, (long) (heartbeatIntervalMs * 0.8));
+        // BUG-004：判定"僵尸连接"的超时阈值。服务端对每个心跳都会回 op 11 ACK，
+        // 因此连续 2 个多周期收不到任何入站帧，即可判定连接已死。
+        final long inboundTimeout = Math.max(20_000L, (long) (heartbeatIntervalMs * 2.5));
+        // 新连接的存活基准从这里开始计，避免刚建连就被误判
+        lastInboundAt = System.currentTimeMillis();
+
         heartbeatTimer.scheduleAtFixedRate(() -> {
             // 连接换代后旧定时器不得再发（避免往已关闭连接写数据）
             if (gen != connectionGeneration || closed.get()) return;
+
+            // ── BUG-004：僵尸连接检测（必须放在发心跳之前）──
+            // 休眠/断网后 TCP 可能半开：sendText 仍"成功"，日志照打「心跳已发送」，
+            // 但服务端收不到、也不再回 ACK。此时必须主动断开，QQ 才会把 bot 标记为
+            // 离线并**排队**用户消息；否则 QQ 以为 bot 在线，会把消息推进死连接而丢失。
+            long silent = System.currentTimeMillis() - lastInboundAt;
+            if (lastInboundAt > 0 && silent > inboundTimeout) {
+                log("[WS] 已 " + (silent / 1000) + "s 未收到任何服务端帧（含心跳 ACK），"
+                        + "判定连接已僵死，主动断开以促使 QQ 标记离线并排队消息（代数 " + gen + "）");
+                WebSocket dead = ws;
+                if (dead != null) {
+                    try { dead.abort(); } catch (Throwable ignore) {}
+                }
+                return; // abort 会触发 onClose/onError → 交回 runForever 重连
+            }
+
             try {
                 JsonObject p = new JsonObject();
                 p.addProperty("op", 1);
                 if (hasSeq) p.addProperty("d", lastSeq.get());
                 else p.add("d", com.google.gson.JsonNull.INSTANCE); // 首次心跳 d=null
                 send(p.toString());
-                if (verboseHeartbeat) log("[WS] 心跳已发送 seq=" + (hasSeq ? lastSeq.get() : -1));
+                if (verboseHeartbeat) log("[WS] 心跳已发送 seq=" + (hasSeq ? lastSeq.get() : -1)
+                        + "（距上次入站 " + (silent / 1000) + "s）");
             } catch (Throwable t) {
                 log("[WS] 心跳发送失败: " + t.getMessage());
             }
         }, period, period, TimeUnit.MILLISECONDS);
-        log("[WS] 心跳已启动，实际周期 " + period + "ms（服务端要求 " + heartbeatIntervalMs + "ms）");
+        log("[WS] 心跳已启动，实际周期 " + period + "ms（服务端要求 " + heartbeatIntervalMs
+                + "ms，僵死判定阈值 " + inboundTimeout + "ms）");
     }
 
     /** 连接代号：每次 connectOnce 真正建连前自增；用于作废旧心跳定时器、丢弃过期连接帧。 */
     private volatile long connectionGeneration = 0;
+    /**
+     * BUG-004：最近一次**收到任何服务端帧**的时刻（epoch 毫秒）。
+     * <p>
+     * 用于识别"僵尸连接"—— TCP 半开、我方 {@code sendText} 仍能写入缓冲区并打印
+     * 「心跳已发送」，但服务端其实收不到、也**不再回 op 11 Heartbeat ACK**。
+     * 此时连接在双方眼里都是"活"的，QQ 会把用户消息沿这条死连接推下去而丢失。
+     * <p>
+     * <b>不能用 {@code lastSeq} 代替</b>：它只在有事件（op 0 Dispatch）时更新，
+     * 空闲连接本来就长时间不变（实测 seq=13 挂了 12 分钟仍属正常）。
+     */
+    private volatile long lastInboundAt = 0;
     /** 是否打印每次心跳（排查 4009 超时时打开）。 */
     private volatile boolean verboseHeartbeat = true;
 
@@ -362,6 +397,9 @@ public class QqWsClient {
             if (last) {
                 String text = buf.toString();
                 buf.setLength(0);
+                // BUG-004：任何入站帧都算"连接活着"的证据（尤其 op 11 Heartbeat ACK）。
+                // 必须放在最前面，保证即使后续解析失败也能刷新存活时间。
+                lastInboundAt = System.currentTimeMillis();
                 // 先 request(1) 保证读线程不被后续处理阻塞，再异步处理
                 webSocket.request(1);
                 dispatchAsync(text);

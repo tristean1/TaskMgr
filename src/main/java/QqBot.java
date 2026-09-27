@@ -89,6 +89,7 @@ public class QqBot {
                 + File.separator + "tasks.db";
         File pf = new File(dbPath).getParentFile();
         if (pf != null) pf.mkdirs();
+        pruneOldLogs();   // BUG-004：启动时清理 7 天前的日志
         try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbPath)) {
             try (Statement st = conn.createStatement()) {
                 st.execute("PRAGMA journal_mode=WAL;");
@@ -507,7 +508,57 @@ public class QqBot {
     }
 
     private void log(String line) {
-        System.out.println("[" + java.time.LocalTime.now().withNano(0) + "] " + line);
+        String stamped = "[" + java.time.LocalTime.now().withNano(0) + "] " + line;
+        System.out.println(stamped);
+        // BUG-004 诊断：控制台缓冲区一满就覆盖，已两次导致故障现场丢失（09-24 / 09-25）。
+        // 这里同时追加写入文件，保留可回查的日志。写失败绝不影响主流程。
+        appendLogFile(stamped);
+    }
+
+    // ───────────────────── 文件日志（BUG-004 诊断用）─────────────────────
+    /** 日志目录：~/.taskmgr/logs/ ；按日一个文件，超过 7 天自动清理。 */
+    private static final java.io.File LOG_DIR =
+            new java.io.File(System.getProperty("user.home") + java.io.File.separator
+                    + ".taskmgr" + java.io.File.separator + "logs");
+    /** 每天最多写多少字节后停止追加，避免异常刷屏把磁盘写满（约 5MB）。 */
+    private static final long LOG_MAX_BYTES = 5L * 1024 * 1024;
+    private static volatile boolean logFileDisabled = false;
+
+    private static synchronized void appendLogFile(String line) {
+        if (logFileDisabled) return;
+        try {
+            if (!LOG_DIR.exists() && !LOG_DIR.mkdirs()) {
+                logFileDisabled = true;
+                return;
+            }
+            java.io.File f = new java.io.File(LOG_DIR,
+                    "qqbot-" + java.time.LocalDate.now() + ".log");
+            if (f.exists() && f.length() > LOG_MAX_BYTES) return; // 超限则本轮不再写
+            try (java.io.FileWriter w = new java.io.FileWriter(f, java.nio.charset.StandardCharsets.UTF_8, true)) {
+                w.write(line);
+                w.write(System.lineSeparator());
+            }
+        } catch (Throwable t) {
+            // 日志写失败不影响任何功能：静默关闭文件日志，避免反复抛异常刷屏
+            logFileDisabled = true;
+        }
+    }
+
+    /** 清理 7 天前的日志文件（启动时调用一次即可）。 */
+    static void pruneOldLogs() {
+        try {
+            if (!LOG_DIR.isDirectory()) return;
+            long cutoff = System.currentTimeMillis() - 7L * 24 * 3600 * 1000;
+            java.io.File[] files = LOG_DIR.listFiles();
+            if (files == null) return;
+            for (java.io.File f : files) {
+                if (f.isFile() && f.getName().startsWith("qqbot-") && f.lastModified() < cutoff) {
+                    //noinspection ResultOfMethodCallIgnored
+                    f.delete();
+                }
+            }
+        } catch (Throwable ignore) {
+        }
     }
 // ───────────────────────────── M1 提醒 ─────────────────────────────
     /**
