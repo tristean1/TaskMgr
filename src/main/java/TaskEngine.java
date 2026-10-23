@@ -24,6 +24,8 @@ public class TaskEngine {
     /** 操作日志 + 撤销（S4）。在构造时初始化并注入任务名解析器。 */
     private final OpLogKit opLog;
     private final WorkTimer workTimer;
+    /** 「下一条该做哪件」的排序策略（REQ-004）。规则可整体替换，调用方不感知。 */
+    private final NextSelector nextSelector = new NextSelector();
     private final Clock clock;
     private String commandSource = "cli";
     /**
@@ -194,6 +196,7 @@ public class TaskEngine {
                 catch (SQLException e) { out.accept("[错误] 暂停计时失败：" + e.getMessage()); }
                 break;
             case "add":       handleAdd(argv);   break;
+            case "next":      handleNext(argv);  break;
             case "list":
             case "ls":        handleList(argv);  break;
             case "done":      handleSetStatus(argv, "done");    break;
@@ -344,7 +347,10 @@ public class TaskEngine {
         if (newId == null) return; // 插入失败，addTask 已报错
 
         echoAdd(newId, title, finalPriority, triggerAt, remindAt, estimate, aiUsed);
-        handleList(new String[0]);
+        // REQ-008（2026-10-23）：回执只留这一条任务，不再把全表打一遍。
+        // 想看全部时打 `list all`；这一行留着只会让「刚加完」的确认信息淹在列表里。
+        // 同时把这条任务记成「最近出现的任务」，作为无参 done/remove 的首选目标（REQ-004）。
+        markShown(newId);
     }
 // ─────────────────────────── add 的插入助手 ───────────────────────────
     /**
@@ -529,6 +535,18 @@ public class TaskEngine {
             return null;
         }
     }
+    /** task_id → 备注（next 回显用）；没有备注返回 null。 */
+    private String noteOf(String id) {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT note FROM tasks WHERE id=?")) {
+            ps.setString(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        } catch (SQLException e) {
+            return null;
+        }
+    }
+
     // ─────────────────── 入站事件去重（BUG-018） ───────────────────
     /** 该入站事件是否已处理过（跨进程持久化）。 */
     public boolean isInboundSeen(String eventKey) {
@@ -567,17 +585,210 @@ public class TaskEngine {
         }
     }
 
+// ───────────────── 「最近出现的任务」指针（REQ-004 C 口径的中间层） ─────────────────
+    /**
+     * meta 表里存「最近一次单独出现在用户面前的任务 id」。
+     *
+     * <p><b>为什么单独记一个指针，而不复用 last_notified_at：</b>{@code add} 回执和
+     * {@code next} 都会把一条任务摆到用户眼前，这时用户想 {@code done} 的就是它——
+     * 但这两条路径都不发提醒，所以 {@code last_notified_at} 是空的。
+     * 指针让「刚看到 → 立刻做完」这条最短路径成立。
+     */
+    private static final String META_SHOWN_ID = "last_shown_task_id";
+    /** 指针的写入时刻（epoch ms），用于和 {@code last_notified_at} 比谁更晚。 */
+    private static final String META_SHOWN_AT = "last_shown_at";
+
+    /**
+     * 记下「这条任务刚刚单独出现在用户面前」（{@code add} 回执、{@code next}）。
+     *
+     * <p><b>best-effort：</b>写失败绝不抛出。指针只是「默认目标」的缓存，不是事实来源；
+     * 丢了它就退回「上次提醒的 / {@code next()}」，功能降级但不报错——
+     * 不能为了让 {@code done} 少打一个名字，反而让 {@code add} 失败。
+     */
+    private void markShown(String taskId) {
+        if (taskId == null) return;
+        try {
+            metaPut(META_SHOWN_ID, taskId);
+            metaPut(META_SHOWN_AT, Long.toString(clock.millis()));
+        } catch (SQLException ignore) {
+            // 见方法注释：指针写不进去就退回旧口径。
+        }
+    }
+
+    private String metaGet(String key) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT value FROM meta WHERE key=?")) {
+            ps.setString(1, key);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    private void metaPut(String key, String value) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)")) {
+            ps.setString(1, key);
+            ps.setString(2, value);
+            ps.executeUpdate();
+        }
+    }
+
+    /** 读 meta 里的 epoch ms；缺失或格式坏了返回 -1（当作「没记过」）。 */
+    private long metaGetLong(String key) {
+        try {
+            String raw = metaGet(key);
+            return raw == null ? -1L : Long.parseLong(raw.strip());
+        } catch (SQLException | NumberFormatException e) {
+            return -1L;
+        }
+    }
+
+// ─────────────────────────── next（REQ-004） ───────────────────────────
+    /**
+     * next —— 回一条「下一条该做」的任务，并把它记成「最近出现的任务」。
+     *
+     * <p>排序规则不在方法里，在 {@link NextSelector}（用户要求可替换）。
+     * 本方法只负责：取候选 → 让策略挑一条 → 回显 → 更新指针。
+     * 回执刻意带「做完直接发 done」——这正是 next + C 口径存在的意义。
+     */
+    private void handleNext(String[] argv) {
+        if (argv.length > 0) {
+            out.accept("[提示] next 不带参数。用法：next　（看完直接 done 即可）");
+            return;
+        }
+        try {
+            NextSelector.Candidate pick = nextSelector.pick(todoCandidates(), clock.millis());
+            if (pick == null) {
+                out.accept("[提示] 没有待办任务。发 add <标题> 添加");
+                return;
+            }
+            markShown(pick.id());
+            StringBuilder sb = new StringBuilder("▶ 下一条：").append(pick.title());
+            sb.append("\n     ").append(pick.hasDue()
+                    ? "DDL " + fmtEpoch(pick.dueAt())
+                    : "无 DDL（不会提醒）");
+            sb.append(" ｜ 优先级 ").append(pick.priority());
+            String note = noteOf(pick.id());
+            if (note != null && !note.isBlank()) sb.append(" ｜ 备注 ").append(note);
+            sb.append("\n     做完直接发 done（不用输名字）；记错了发 undo");
+            WorkTimer.Session active = workTimer.current();
+            if (active != null) {
+                sb.append("\n[提示] 当前在计时：「").append(active.label()).append("」，done 会先收尾计时");
+            }
+            out.accept(sb.toString());
+        } catch (SQLException e) {
+            out.accept("[错误] next 失败：" + e.getMessage());
+        }
+    }
+
+    /** 供 {@link NextSelector} 排序用的待办快照（只读，不改库）。 */
+    private java.util.List<NextSelector.Candidate> todoCandidates() throws SQLException {
+        String sql = "SELECT id,title,priority,trigger_at,remind_at,created_at "
+                + "FROM tasks WHERE status='todo'";
+        java.util.List<NextSelector.Candidate> list = new java.util.ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                long trigger = rs.getLong("trigger_at");
+                Long triggerAt = rs.wasNull() ? null : trigger;
+                long remind = rs.getLong("remind_at");
+                Long remindAt = rs.wasNull() ? null : remind;
+                // 时间口径与 ReminderService 一致：trigger_at 优先，其次 remind_at
+                list.add(new NextSelector.Candidate(rs.getString("id"), rs.getString("title"),
+                        triggerAt != null ? triggerAt : remindAt,
+                        rs.getInt("priority"), rs.getLong("created_at")));
+            }
+        }
+        return list;
+    }
+
+    /**
+     * 无参 {@code done}/{@code remove} 的作用目标（REQ-004，2026-10-23 裁定 C）。
+     *
+     * <p>顺序：<b>最近出现的任务</b>（meta 指针）&gt; <b>上次提醒的</b> &gt; {@code next()}。
+     * 前两者同时存在时按时间戳取更晚的那个——「我刚看到它」比「它几小时前提醒过」更新鲜。
+     * 指针指向的任务若已不是 todo（被 done/remove 了）就当它不存在，直接降到下一档。
+     *
+     * @return {@code {id, title}}；没有可作用的任务时返回 {@code null}（由调用方给提示）
+     */
+    private String[] resolveBareTarget() throws SQLException {
+        String shownId = null;
+        String shownTitle = null;
+        String pointer = metaGet(META_SHOWN_ID);
+        if (pointer != null) {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT title FROM tasks WHERE id=? AND status='todo'")) {
+                ps.setString(1, pointer);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        shownId = pointer;
+                        shownTitle = rs.getString(1);
+                    }
+                }
+            }
+        }
+        long shownAt = shownId == null ? -1L : metaGetLong(META_SHOWN_AT);
+
+        String notifiedId = null;
+        String notifiedTitle = null;
+        long notifiedAt = -1L;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT id,title,last_notified_at FROM tasks "
+                        + "WHERE status NOT IN ('done','removed') AND last_notified_at IS NOT NULL "
+                        + "ORDER BY last_notified_at DESC LIMIT 1");
+             ResultSet rs = ps.executeQuery()) {
+            if (rs.next()) {
+                notifiedId = rs.getString("id");
+                notifiedTitle = rs.getString("title");
+                notifiedAt = rs.getLong("last_notified_at");
+            }
+        }
+
+        if (shownId != null && notifiedId != null) {
+            return shownAt >= notifiedAt
+                    ? new String[]{shownId, shownTitle}
+                    : new String[]{notifiedId, notifiedTitle};
+        }
+        if (shownId != null) return new String[]{shownId, shownTitle};
+        if (notifiedId != null) return new String[]{notifiedId, notifiedTitle};
+
+        NextSelector.Candidate pick = nextSelector.pick(todoCandidates(), clock.millis());
+        return pick == null ? null : new String[]{pick.id(), pick.title()};
+    }
+
 // ─────────────────────────── done / remove ───────────────────────────
     /**
-     * done/remove <任务名>：把指定任务置为 done / removed；不写任务名时作用于
-     * 「上次提醒过的任务」（last_notified_at 最晚且未完成未删除）。
+     * done/remove <任务名>：把指定任务置为 done / removed。
+     *
+     * <p>不写任务名时的目标见 {@link #resolveBareTarget()}：
+     * 最近出现的任务 &gt; 上次提醒的 &gt; {@code next()}（REQ-004，2026-10-23 裁定 C）。
+     *
+     * <p>成功后会追加一行「下一条：…」，因为最重要的动作是 {@code done}，
+     * 而做完之后用户下一个想知道的就是「接下来做什么」——顺手给出来，省一次 next。
      */
     private void handleSetStatus(String[] argv, String newStatus) {
         try {
             String result = SqlTransaction.run(conn, () -> setStatusWithTiming(argv, newStatus));
-            out.accept(result);
+            out.accept(result + nextAfterHint(result));
             if (result.contains("[计时结束]")) workTimer.event(result);
         } catch (SQLException e) { out.accept("[错误] " + newStatus + " 失败（未提交）：" + e.getMessage()); }
+    }
+
+    /**
+     * done/remove 成功时附一条「下一条」提示（REQ-004 §151 裁定 C）。
+     *
+     * <p>只在本条命令真的改了状态（回执以 {@code [OK]} 开头）时才给：
+     * 纯活动收尾、找不到任务、批量失败这些情况都不该冒出「下一条」。
+     * 失败时静默返回空串——提示是附赠品，不能因为它报错而让 done 看起来失败。
+     */
+    private String nextAfterHint(String result) {
+        if (result == null || !result.startsWith("[OK]")) return "";
+        try {
+            NextSelector.Candidate next = nextSelector.pick(todoCandidates(), clock.millis());
+            return "\n下一条：" + (next == null ? "没有待办任务" : next.title());
+        } catch (SQLException e) {
+            return "";
+        }
     }
 
     private String setStatusWithTiming(String[] argv, String newStatus) throws SQLException {
@@ -593,17 +804,14 @@ public class TaskEngine {
                     + "\n[提示] 纯活动，不修改任务列表。";
         } else {
             if (argv.length == 0) {
-                // 留空 -> 上次提醒的任务
-                String sql = "SELECT id,title FROM tasks "
-                        + "WHERE status NOT IN ('done','removed') AND last_notified_at IS NOT NULL "
-                        + "ORDER BY last_notified_at DESC LIMIT 1";
-                try (PreparedStatement ps = conn.prepareStatement(sql);
-                     ResultSet rs = ps.executeQuery()) {
-                    if (rs.next()) { id = rs.getString("id"); title = rs.getString("title"); }
+                // 留空 -> 最近出现的任务 > 上次提醒的 > next()（REQ-004 2026-10-23 裁定 C）
+                String[] target = resolveBareTarget();
+                if (target == null) {
+                    return "[提示] 没有可" + ("done".equals(newStatus) ? "完成" : "移除")
+                            + "的任务（发 next 看看下一步）";
                 }
-                if (id == null) {
-                    return "[提示] 没有最近提醒过的任务";
-                }
+                id = target[0];
+                title = target[1];
             } else {
                 title = String.join(" ", argv);
                 String sql = "SELECT id, title, status FROM tasks "
@@ -737,7 +945,7 @@ public class TaskEngine {
      * list —— 列出任务（REQ-005，2026-10-11 实施）。
      * <p>无参<b>只列 TODO</b>：DONE 会无限累积，旧行为（TODO+DONE 混列）几天就把待办淹没。
      * {@code list all} 列 TODO + DONE；{@code list <状态>} 列指定状态。
-     * <p>注意：{@code handleAdd} 末尾也调用本方法（回显），语义一变它跟着变。
+     * <p>注意：{@code handleAdd} 曾在末尾调用本方法回显全表（REQ-008，2026-10-23 已删除）。
      */
     private void handleList(String[] argv) {
         // BUG-023：原实现只读 argv[0]，list done extra 会静默忽略多余参数。
@@ -842,13 +1050,13 @@ public class TaskEngine {
             + "      注意：-n 必须放在最后，其后所有内容都会作为备注；未知开关（如 -x）会直接报错\n"
             + "  list | ls          —— 列出待办任务（TODO，默认）\n"
             + "  list done|removed|all  —— 列出 已完成 / 已移除 / 全部（TODO+DONE）\n"
-            + "  done [任务名]      —— 完成任务（留空=上次提醒的任务）\n"
-            + "  remove [任务名]    —— 移除任务（留空=上次提醒的任务）\n"
+            + "  next               —— 下一条该做的任务（时间最近 + 优先级可插队）\n"
+            + "  done [任务名]      —— 完成任务；留空时目标＝计时中的活动 > 最近出现的任务 > 上次提醒的 > next\n"
+            + "  remove [任务名]    —— 移除任务；留空的取法同 done\n"
             + "  undo               —— 撤销最近一次 add/remove/done（安全网，重启后仍有效）\n"
             + "  working | w <活动名> —— 开始/切换计时；无参查看当前或继续最近活动\n"
             + "  pause | p          —— 暂停当前活动；计时区间不随 undo 回滚\n"
             + "  stats [today|week|all] [活动名] —— 时长、占比、样本数、中位数与排除项；默认今天\n"
-            + "  done/remove        —— 优先结束当前计时，关联任务同时完成/移除；无计时仍取最近提醒任务\n"
             + "  export [文件]      —— 导出未来7天任务为 .ics（手机日历兜底）\n"
             + "  nl <一句话>        —— [临时·S2] 用 AI 解析一句话并打印结果（不入库）\n"
             + "  init               —— 重建数据库表，清空任务与计时历史（危险）\n"
