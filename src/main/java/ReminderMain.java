@@ -21,8 +21,13 @@ public class ReminderMain {
             }
             
             try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbPath)) {
+                TaskEngine engine = new TaskEngine(conn);
+                engine.timingTick(System.out::println);
+                Runtime.getRuntime().addShutdownHook(new Thread(() -> engine.shutdownTiming(System.out::println), "timing-shutdown"));
                 // 启动提醒服务：5秒后开始，每10秒检查一次
                 ReminderService reminder = new ReminderService(conn);
+                reminder.setLogger(System.err::println);
+                reminder.setOnTick(() -> engine.timingTick(System.out::println));
                 reminder.start(5000, 10_000L);
                 
                 System.out.println("提醒守护进程已启动，监听数据库: " + dbPath);

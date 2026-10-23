@@ -68,11 +68,12 @@ public class IcsExporter {
         long to = horizon.toEpochMilli();
         int n = 0;
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT id,title,note,trigger_at FROM tasks "
+                "SELECT id,title,note,trigger_at,remind_at FROM tasks "
                 + "WHERE status NOT IN ('done','removed') "
-                + "  AND trigger_at IS NOT NULL "
-                + "  AND trigger_at >= ? AND trigger_at <= ? "
-                + "ORDER BY trigger_at ASC")) {
+                + "  AND (trigger_at IS NOT NULL OR remind_at IS NOT NULL) "
+                + "  AND COALESCE(trigger_at, remind_at) >= ? "
+                + "  AND COALESCE(trigger_at, remind_at) <= ? "
+                + "ORDER BY COALESCE(trigger_at, remind_at) ASC")) {
             ps.setLong(1, from);
             ps.setLong(2, to);
             try (ResultSet rs = ps.executeQuery()) {
@@ -80,8 +81,11 @@ public class IcsExporter {
                     String id = rs.getString("id");
                     String title = rs.getString("title");
                     String note = rs.getString("note");
-                    long triggerAt = rs.getLong("trigger_at");
-                    appendEvent(sb, id, title, note, triggerAt, now);
+                    Long triggerAt = nullableLong(rs, "trigger_at");
+                    Long remindAt = nullableLong(rs, "remind_at");
+                    // 有效时间：优先 DDL(trigger_at)，否则用提醒时刻(remind_at)；两者皆无的行已被 SQL 过滤。
+                    long effectiveAt = triggerAt != null ? triggerAt : remindAt;
+                    appendEvent(sb, id, title, note, effectiveAt, triggerAt, remindAt, now);
                     n++;
                 }
             }
@@ -91,9 +95,9 @@ public class IcsExporter {
     }
 
     private void appendEvent(StringBuilder sb, String id, String title, String note,
-                             long triggerAt, Instant now) {
+                             long effectiveAt, Long triggerAt, Long remindAt, Instant now) {
         String uid = sanitize(id) + "@taskmgr";
-        String dtstart = UTC_FMT.format(Instant.ofEpochMilli(triggerAt));
+        String dtstart = UTC_FMT.format(Instant.ofEpochMilli(effectiveAt));
         String dtstamp = UTC_FMT.format(now);
         line(sb, "BEGIN:VEVENT");
         line(sb, "UID:" + uid);
@@ -105,10 +109,29 @@ public class IcsExporter {
         }
         line(sb, "BEGIN:VALARM");
         line(sb, "ACTION:DISPLAY");
-        line(sb, "TRIGGER:PT0M");
+        line(sb, "TRIGGER:" + alarmTrigger(triggerAt, remindAt));
         line(sb, "DESCRIPTION:" + escape(title));
         line(sb, "END:VALARM");
         line(sb, "END:VEVENT");
+    }
+
+    /**
+     * VALARM 的 TRIGGER 值：提醒时刻相对 DDL 的负偏移（-PT{秒}S）；没有可用的提前量时 PT0M。
+     * <p>只有 trigger_at 或只有 remind_at 的任务无从计算提前量 → PT0M；
+     * remind_at 不早于 trigger_at（含历史脏数据）也按 PT0M 处理，绝不生成正偏移。
+     */
+    private static String alarmTrigger(Long triggerAt, Long remindAt) {
+        if (triggerAt == null || remindAt == null) return "PT0M";
+        long diff = triggerAt - remindAt;
+        if (diff <= 0) return "PT0M";
+        long seconds = Math.max(1L, diff / 1000L); // 不足 1 秒按 1 秒，避免 -PT0S
+        return "-PT" + seconds + "S";
+    }
+
+    /** 读取可空 INTEGER 列：NULL 返回 {@code null}（{@link ResultSet#getLong} 遇 NULL 会返回 0，不能直接用）。 */
+    private static Long nullableLong(ResultSet rs, String column) throws SQLException {
+        long v = rs.getLong(column);
+        return rs.wasNull() ? null : v;
     }
 
     /** 写一行并用 CRLF 收尾；超长内容按 “≤70 字符、UTF-8 字节 ≤74” 折行（不拆开多字节字符）。 */

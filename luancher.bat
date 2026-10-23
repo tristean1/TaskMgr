@@ -1,3 +1,5 @@
-cd D:/Java/TaskMgr
-java "-Dfile.encoding=UTF-8" -cp "target\classes;$env:USERPROFILE\.m2\repository\com\google\code\gson\gson\2.11.0\gson-2.11.0.jar;$env:USERPROFILE\.m2\repository\org\xerial\sqlite-jdbc\3.46.0.0\sqlite-jdbc-3.46.0.0.jar;$env:USERPROFILE\.m2\repository\org\slf4j\slf4j-api\1.7.36\slf4j-api-1.7.36.jar" QqBot
-pause
+@echo off
+chcp 65001 >nul
+REM 历史遗留的启动器文件名（luancher = launcher 拼写错误）。
+REM 统一转给 start_qqbot.bat，避免重复维护 classpath；那里用 %~dp0 解析路径，cmd 可直接运行。
+call "%~dp0start_qqbot.bat"

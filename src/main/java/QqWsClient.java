@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -67,6 +68,12 @@ public class QqWsClient {
     private volatile long heartbeatIntervalMs = 45_000L;
 
     /**
+     * BUG-026：僵尸连接被判定后，runForever 重连前需要保持离线的时长（毫秒）。
+     * 由心跳检测分支写入，runForever 读取后立即清零，保证只生效一次。
+     */
+    private volatile long pendingOfflineHoldMs = 0;
+
+    /**
      * 帧处理线程：单线程串行，既避免阻塞 selector 读线程，又保证帧按序处理。
      */
     private final java.util.concurrent.ExecutorService handlerExecutor =
@@ -75,6 +82,25 @@ public class QqWsClient {
                 t.setDaemon(true);
                 return t;
             });
+
+    /**
+     * BUG-019：鉴权超时看门狗专用调度器（独立的 daemon 线程，不与心跳定时器/帧处理执行器共用）。
+     * 建连后 30s 内收不到 READY/RESUMED 就主动断开，避免"连上但永远不鉴权"把 runForever 卡死。
+     */
+    private final ScheduledExecutorService authWatchdogExecutor =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "qqbot-ws-auth-watchdog");
+                t.setDaemon(true);
+                return t;
+            });
+    /** 当前已安装的鉴权看门狗任务句柄（null 表示未安装）。 */
+    private volatile ScheduledFuture<?> authWatchdog;
+    /** 鉴权看门狗所属的连接代号。 */
+    private volatile long authWatchdogGen = -1;
+    /** 最近一次鉴权成功（READY/RESUMED）的连接代号，防止看门狗误杀刚鉴权成功的连接。 */
+    private volatile long authenticatedGen = -1;
+    /** 建连后等待 READY/RESUMED 的最长时间。 */
+    private static final long AUTH_TIMEOUT_MS = 30_000L;
 
     /** 重连退避，避免断线风暴。 */
     private int reconnectAttempt = 0;
@@ -160,6 +186,15 @@ public class QqWsClient {
             } catch (Throwable t) {
                 log("[WS] 连接异常: " + t.getMessage());
             }
+            // BUG-026：若本次断开是"僵尸连接被判死"，先保持离线一段时间再重连，
+            // 让 QQ 侧有机会把 bot 标记为离线并把用户消息排进队列（否则重连太快会继续丢消息）。
+            long offlineHold = pendingOfflineHoldMs;
+            if (offlineHold > 0) {
+                pendingOfflineHoldMs = 0;   // 先读取后清零：只保持一次，重连后不再重复等待
+                log("[WS] 连接已僵死，保持离线 " + (offlineHold / 1000) + "s 后再重连"
+                        + "（让 QQ 排队用户消息）");
+                if (!closed.get()) sleep(offlineHold);
+            }
             if (closed.get()) break;
             long backoff = Math.min(30_000L, 1_000L * (1L << Math.min(reconnectAttempt, 5)));
             reconnectAttempt++;
@@ -172,6 +207,15 @@ public class QqWsClient {
     public void close() {
         closed.set(true);
         stopHeartbeat();
+        // BUG-019：鉴权看门狗与帧处理执行器都必须在关闭时停掉，避免残留后台线程；
+        // 两者都做空值保护，重复 close 也安全。
+        cancelAuthWatchdog(connectionGeneration);
+        if (authWatchdogExecutor != null) {
+            try { authWatchdogExecutor.shutdownNow(); } catch (Throwable ignore) {}
+        }
+        if (handlerExecutor != null) {
+            try { handlerExecutor.shutdownNow(); } catch (Throwable ignore) {}
+        }
         WebSocket s = ws;
         if (s != null) {
             try { s.sendClose(WebSocket.NORMAL_CLOSURE, "bye"); } catch (Throwable ignore) {}
@@ -215,6 +259,9 @@ public class QqWsClient {
             try { this.ws.abort(); } catch (Throwable ignore) {}
         }
         this.ws = socket;
+
+        // BUG-019：建连后启动鉴权超时看门狗——30s 内收不到 READY/RESUMED 就断开重连。
+        armAuthWatchdog(myGen);
 
         // 后续动作（Identify / 心跳）由 Listener 收到 OP 10 Hello 后驱动，
         // 因为必须等 Hello 才知道 heartbeat_interval。
@@ -363,6 +410,17 @@ public class QqWsClient {
             if (lastInboundAt > 0 && silent > inboundTimeout) {
                 log("[WS] 已 " + (silent / 1000) + "s 未收到任何服务端帧（含心跳 ACK），"
                         + "判定连接已僵死，主动断开以促使 QQ 标记离线并排队消息（代数 " + gen + "）");
+                // BUG-026：这条连接上的会话已经不可信（僵尸期间很可能漏过事件），
+                // 清掉本地 session 并抹掉持久化记录，重连时强制走全新 Identify。
+                sessionId = null;
+                resumeGatewayUrl = null;
+                hasSeq = false;
+                dropPersistedSession();
+                // BUG-026：断开后先保持离线一段时间，让 QQ 侧确认 bot 离线并把消息排队；
+                // 否则立刻重连可能又接上一条死路，用户消息继续丢。
+                pendingOfflineHoldMs = offlineHoldMillis(heartbeatIntervalMs);
+                // 连接已死，鉴权看门狗不再需要；否则它 30s 后还会对这条死连接再报一次"鉴权超时"
+                cancelAuthWatchdog(gen);
                 // ① 先停掉本连接的心跳定时器，避免判定后继续重复刷屏
                 stopHeartbeatIfCurrent(gen);
                 // ② 主动解除 awaitClose 的等待。
@@ -424,6 +482,59 @@ public class QqWsClient {
         stopHeartbeat();
     }
 
+    // ───────────────────── 鉴权超时看门狗（BUG-019） ─────────────────────
+
+    /** 建连后安装"30s 内必须收到 READY/RESUMED"的看门狗；超时则断开当前连接并唤醒 runForever 重连。 */
+    private synchronized void armAuthWatchdog(long gen) {
+        // 握手极快时 READY/RESUMED 可能先于本方法执行，已鉴权就不必再安装
+        if (authenticatedGen == gen) return;
+        ScheduledFuture<?> old = authWatchdog;
+        if (old != null) old.cancel(false);
+        authWatchdogGen = gen;
+        authWatchdog = authWatchdogExecutor.schedule(() -> {
+            synchronized (QqWsClient.this) {
+                // 已是新一代连接，或本次连接早已鉴权成功 → 看门狗无事可做
+                if (gen != connectionGeneration || authenticatedGen == gen) return;
+                authWatchdog = null;
+                authWatchdogGen = -1;
+            }
+            log("[WS] 建连后 " + (AUTH_TIMEOUT_MS / 1000) + "s 内未收到 READY/RESUMED，"
+                    + "判定鉴权超时，主动断开重连（代数 " + gen + "）");
+            WebSocket dead = ws;
+            if (dead != null) {
+                try { dead.abort(); } catch (Throwable ignore) {}
+            }
+            // 不能只依赖 abort 触发 onClose/onError：已僵死的连接可能两个回调都不来，
+            // 那样 awaitClose 永不返回，runForever 也就不会重连。
+            signalClosed(gen);
+        }, AUTH_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /** 取消鉴权看门狗（READY/RESUMED/onClose/onError/close 时调用）；只取消属于该代的任务。 */
+    private synchronized void cancelAuthWatchdog(long gen) {
+        if (authWatchdogGen != gen) return;
+        ScheduledFuture<?> f = authWatchdog;
+        if (f != null) {
+            f.cancel(false);
+            authWatchdog = null;
+        }
+        authWatchdogGen = -1;
+    }
+
+    /** 标记该连接鉴权成功（READY/RESUMED）并撤掉看门狗。 */
+    private synchronized void markAuthenticated(long gen) {
+        authenticatedGen = gen;
+        cancelAuthWatchdog(gen);
+    }
+
+    /**
+     * BUG-026：僵尸连接判定后的"离线保持"时长 = max(90s, 2 × 心跳周期)。
+     * package-private 便于测试直接校验取值规则。
+     */
+    static long offlineHoldMillis(long heartbeatIntervalMs) {
+        return Math.max(90_000L, 2L * heartbeatIntervalMs);
+    }
+
     private void sleep(long ms) {
         try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
@@ -480,13 +591,17 @@ public class QqWsClient {
 
         /** 把帧处理放到独立线程，避免阻塞 selector 读线程。 */
         private void dispatchAsync(String text) {
-            handlerExecutor.execute(() -> {
-                try {
-                    handleFrame(text);
-                } catch (Throwable t) {
-                    log("[WS] 处理帧失败: " + t.getMessage());
-                }
-            });
+            try {
+                handlerExecutor.execute(() -> {
+                    try {
+                        handleFrame(text);
+                    } catch (Throwable t) {
+                        log("[WS] 处理帧失败: " + t.getMessage());
+                    }
+                });
+            } catch (java.util.concurrent.RejectedExecutionException ignore) {
+                // BUG-019：close() 已 shutdownNow 帧处理执行器，关闭过程中残留的帧直接丢弃
+            }
         }
 
         @Override
@@ -494,6 +609,7 @@ public class QqWsClient {
             log("[WS] 连接关闭 code=" + statusCode + " reason=" + reason
                     + describeCode(statusCode) + "（代数 " + myGen + "）");
             stopHeartbeatIfCurrent(myGen);
+            cancelAuthWatchdog(myGen);   // BUG-019：连接已结束，撤掉本代的鉴权看门狗
 
             // BUG-003：已被新连接取代的旧连接，其关闭不得影响当前会话状态
             if (myGen != connectionGeneration) {
@@ -546,6 +662,7 @@ public class QqWsClient {
         public void onError(WebSocket webSocket, Throwable error) {
             log("[WS] 连接错误（代数 " + myGen + "）: " + error);
             stopHeartbeatIfCurrent(myGen);
+            cancelAuthWatchdog(myGen);   // BUG-019：连接已结束，撤掉本代的鉴权看门狗
             signalClosed(myGen);
         }
 
@@ -606,6 +723,8 @@ public class QqWsClient {
                         if (d.has("session_id")) sessionId = d.get("session_id").getAsString();
                         reconnectAttempt = 0; // 登录成功，重置退避
                         resumeFailures = 0;   // 登录成功即视为 Resume 链路正常
+                        // BUG-019：鉴权已成功，撤掉超时看门狗
+                        markAuthenticated(myGen);
                         // 会话持久化：新建的 session 立刻落盘，供进程重启后 Resume
                         persistSession();
                         log("[WS] 鉴权成功 READY，session_id=" + sessionId
@@ -615,6 +734,8 @@ public class QqWsClient {
                     if ("RESUMED".equals(t)) {
                         reconnectAttempt = 0;
                         resumeFailures = 0;   // Resume 成功，清零失败计数
+                        // BUG-019：鉴权已成功，撤掉超时看门狗
+                        markAuthenticated(myGen);
                         // 会话持久化：Resume 后 seq 可能已推进，刷新一次
                         persistSession();
                         log("[WS] 会话已恢复 RESUMED（seq=" + (hasSeq ? lastSeq.get() : -1) + "）");
@@ -622,12 +743,16 @@ public class QqWsClient {
                     }
                     JsonObject d = msg.has("d") && msg.get("d").isJsonObject()
                             ? msg.getAsJsonObject("d") : new JsonObject();
-                    // 会话持久化：每收到一个事件就刷新 seq，保证重启后 Resume 不漏事件。
-                    // 事件频率极低（只在用户真的操作时才有），落盘开销可忽略。
-                    persistSession();
-                    // 交给上层（QqBot 的 dispatchEvent 逻辑）
+                    // BUG-018：先执行业务回调、等业务落库成功后再推进持久化的 seq。
+                    // 若像以前那样先落盘再处理，进程在两者之间崩溃时重启会用已推进的 seq 去 Resume，
+                    // 该事件被永久跳过 → 用户消息丢失。
+                    // 反过来（业务已成功、seq 还没落盘就崩溃）最坏只是重启后重复投递一次，
+                    // 由上层按事件 id 去重，不会丢消息。
                     try {
+                        // 交给上层（QqBot 的 dispatchEvent 逻辑）
                         onEvent.accept(t, d);
+                        // 业务已成功处理，此时再刷新 seq 落盘；事件频率极低，落盘开销可忽略。
+                        persistSession();
                     } catch (Throwable ex) {
                         log("[WS] 事件处理异常(" + t + "): " + ex.getMessage());
                     }
@@ -648,6 +773,14 @@ public class QqWsClient {
                     sessionId = null;
                     hasSeq = false;
                     dropPersistedSession();
+                    // BUG-019：只清字段不够——当前连接还挂着旧会话等关闭，awaitClose 会一直等下去。
+                    // 必须主动断开（仍是本代连接时）并补发本代关闭信号，
+                    // 让 runForever 立刻重连并用全新 Identify 登录。
+                    WebSocket invalidSock = self;
+                    if (invalidSock != null) {
+                        try { invalidSock.abort(); } catch (Throwable ex) { log("[WS] 主动断开失败: " + ex.getMessage()); }
+                    }
+                    signalClosed(myGen);
                     break;
                 default:
                     log("[WS] 未处理 opcode=" + op);

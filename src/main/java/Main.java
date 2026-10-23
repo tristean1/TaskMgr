@@ -2,6 +2,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.Statement;
 import java.util.Scanner;
+import java.nio.charset.StandardCharsets;
 
 /**
  * TaskManager — 效率工具（任务管理 + DDL 提醒）
@@ -39,9 +40,15 @@ public class Main {
             // 命令解析统一入口（构造时幂等建表）
             TaskEngine engine = new TaskEngine(conn);
             engine.setOutput(System.out::println);
+            engine.timingTick(System.out::println);
 
             // 启动提醒服务：先立刻补发一次, 之后每10秒
             ReminderService reminder = new ReminderService(conn);
+            reminder.setLogger(System.out::println);
+            reminder.setOnTick(() -> engine.timingTick(message -> {
+                System.out.println(message);
+                if (qqBot != null && qqBot.isUp()) qqBot.pushRemind(message);
+            }));
             reminder.start(0, 10_000L);
 // 每日自动导出 .ics（手机兜底）：启动时先导一次，之后每 6 小时重导（幂等，容错覆盖“每天至少一次”）
             java.util.concurrent.ScheduledExecutorService icsTimer =
@@ -56,8 +63,10 @@ public class Main {
                 } catch (Throwable ignored) { }
             }, 0, 6 * 60 * 60 * 1000L, java.util.concurrent.TimeUnit.MILLISECONDS);
 
-            // 用系统/控制台默认编码读取输入（Java 17 下默认编码跟随控制台代码页）
-            Scanner sc = new Scanner(System.in);
+            Thread timingShutdown = new Thread(() -> engine.shutdownTiming(System.out::println), "timing-shutdown");
+            Runtime.getRuntime().addShutdownHook(timingShutdown);
+            try {
+            Scanner sc = commandScanner();
             System.out.println("TaskManager. 输入 help 查看用法");
             while (true) {
                 System.out.print("> ");
@@ -85,7 +94,25 @@ public class Main {
                         engine.execute(line);
                 }
             }
+            } finally {
+                reminder.stop();
+                icsTimer.shutdownNow();
+                if (qqBot != null) qqBot.stopMessaging();
+                engine.shutdownTiming(System.out::println);
+                if (qqConn != null) qqConn.close();
+                if (qqLock != null) qqLock.release();
+                try { Runtime.getRuntime().removeShutdownHook(timingShutdown); }
+                catch (IllegalStateException ignored) { }
+            }
         }
+    }
+
+    /** 控制台字符集独立于 file.encoding；管道/文件输入约定为 UTF-8。 */
+    static Scanner commandScanner() {
+        var console = System.console();
+        return console != null
+                ? new Scanner(console.reader())
+                : new Scanner(System.in, StandardCharsets.UTF_8);
     }
 
     /**

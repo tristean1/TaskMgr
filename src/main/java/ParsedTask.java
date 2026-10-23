@@ -113,7 +113,9 @@ public class ParsedTask {
      * 否则用户以为设了提醒、实际永远不会响 —— 这是「信任断裂」的典型场景。
      */
     public boolean hasTime() {
-        return dueAt != null;
+        // BUG-022（2026-10-21 修复）：只看 dueAt 会把「只设了提醒 -a」的任务误判成无时间。
+        // 与 TaskEngine#echoAdd 的判定保持一致：任一时刻非空即算有时间。
+        return dueAt != null || remindAt != null;
     }
 
     /** 调试用；{@code rawJson} 不打印（可能很长，且需要时可直接 get）。 */

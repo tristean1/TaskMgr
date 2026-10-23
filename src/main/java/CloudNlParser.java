@@ -74,6 +74,10 @@ public class CloudNlParser implements NlParser {
         if (text == null || text.trim().isEmpty()) {
             return null;
         }
+        // BUG-012 防御层：只有 cloud 模式才允许发请求（勿仅依赖上层的 auto 开关）。
+        if (!cfg.isCloud()) {
+            throw new NlParseException("AI 未启用（mode=" + cfg.getMode() + "），不会发起请求；当前只支持 cloud 模式");
+        }
         if (!cfg.isConfigured()) {
             // 失败不静默：明确告诉调用方缺什么
             throw new NlParseException("AI 未配置完整（需要 baseurl / apikey / model），请检查 " + ProviderConfig.RESOURCE);

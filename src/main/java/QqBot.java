@@ -52,6 +52,8 @@ public class QqBot {
 
     // ── 提醒：QQ 推送目标列表（group:openid 或 user:openid）──
     private final List<String> remindTargets = new ArrayList<>();
+    /** BUG-027：推送失败重试/弹窗去重（与 ReminderService 同一套节奏）。 */
+    private final ReminderPacing pacing = new ReminderPacing();
 
     /** 控制提醒线程生命周期。 */
     private volatile boolean running = true;
@@ -123,6 +125,8 @@ public class QqBot {
         int port = Integer.parseInt(p.getProperty("port", "9000"));
         // 接入模式：websocket（默认，无需公网 IP）/ webhook（需内网穿透）
         this.mode = p.getProperty("mode", "websocket").trim().toLowerCase();
+        this.bindAddress = p.getProperty("bind", "127.0.0.1").trim();
+        if (this.bindAddress.isEmpty()) this.bindAddress = "127.0.0.1";
         String to = p.getProperty("remind.to", "");
         if (to != null) {
             for (String s : to.split("[,;]")) {
@@ -130,13 +134,19 @@ public class QqBot {
                 if (!t.isEmpty()) remindTargets.add(t);
             }
         }
-        System.out.println("[QQBot] appid=" + blankOr(appId) + ", 模式=" + mode
-                + (isWsMode() ? "" : ", 端口=" + port)
-                + ", 提醒目标=" + remindTargets);
         this.port = port;
+        System.out.println("[QQBot] appid=" + blankOr(appId) + ", 模式=" + mode
+                + (isWsMode() ? "" : ", 监听=" + bindAddress + ":" + port)
+                + ", 提醒目标=" + remindTargets);
     }
 
     private int port = 9000;
+    /**
+     * Webhook 监听地址（BUG-017，2026-10-21 修复）。
+     * <p>默认只绑回环：服务端没有入站验签，暴露到局域网/公网等于允许别人伪造事件。
+     * 需要内网穿透时，穿透客户端通常在本机，回环即可；确需对外监听才在配置里改 bind。
+     */
+    private String bindAddress = "127.0.0.1";
     /** 接入模式：websocket | webhook。 */
     private String mode = "websocket";
     /** WebSocket 客户端（仅 websocket 模式非空）。 */
@@ -168,6 +178,7 @@ public class QqBot {
             System.out.println("[QQBot] 消息功能已在运行（请先 qqbot down）");
             return;
         }
+        engine.timingTick(this::log);
         if (isWsMode()) {
             startWebSocket();
         } else {
@@ -233,11 +244,14 @@ public class QqBot {
                 "appId", appId.trim(),
                 "clientSecret", appSecret.trim(),
                 "grant_type", "client_credentials"));
-        String respText = postText("https://bots.qq.com/app/getAppAccessToken", body, "application/json", null);
-        JsonObject j = JsonParser.parseString(respText).getAsJsonObject();
+        SendResult r = postJson("https://bots.qq.com/app/getAppAccessToken", body, "application/json", null);
+        if (!r.ok()) {
+            throw new IllegalStateException("获取 access_token 失败 HTTP " + r.statusCode() + ": " + r.body());
+        }
+        JsonObject j = JsonParser.parseString(r.body()).getAsJsonObject();
         String token = opt(j, "access_token");
         if (token == null || token.isEmpty()) {
-            throw new IllegalStateException("获取 access_token 失败: " + respText);
+            throw new IllegalStateException("获取 access_token 失败: " + r.body());
         }
         cachedToken = token;
         cachedTokenExpireAt = now + optLong(j, "expires_in", 7200L) * 1000L;
@@ -256,11 +270,22 @@ public class QqBot {
     }
 // ───────────────────────────── Webhook 服务器 ─────────────────────────────
     private void startHttpServer() throws IOException {
-        HttpServer server = HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
+        // BUG-017：默认只监回环。非回环时必须显式配置，并明确告知「无入站验签」的风险。
+        HttpServer server = HttpServer.create(new InetSocketAddress(bindAddress, port), 0);
         server.createContext("/", this::handleCallback);
         server.setExecutor(Executors.newCachedThreadPool());
         server.start();
         this.server = server;
+        boolean loopback = "127.0.0.1".equals(bindAddress) || "localhost".equalsIgnoreCase(bindAddress)
+                || "::1".equals(bindAddress);
+        if (!loopback) {
+            log("[QQBot] ⚠️ Webhook 绑定在非回环地址 " + bindAddress + ":" + port
+                    + "：服务端没有入站验签，任何能访问该端口的人都能伪造事件（含 add/remove）。"
+                    + "请确保只在内网/本机可达。");
+        } else {
+            log("[QQBot] Webhook 仅监听回环 " + bindAddress + ":" + port
+                    + "（内网穿透客户端在本机即可；如需对外监听请显式配置 bind）。");
+        }
     }
 
     private HttpServer server;
@@ -290,6 +315,13 @@ public class QqBot {
     /** 按事件类型分发（WebSocket 与 Webhook 两种模式共用）。 */
     private void dispatchEvent(String type, JsonObject event) {
         if (type == null) { log("[事件] 忽略无类型事件"); return; }
+        // BUG-018（2026-10-21）：会话恢复可能重放「业务已提交、seq 尚未持久化」的事件。
+        // 按「事件类型 + 消息 id」持久化去重，避免重复执行命令（尤其 undo 这种非幂等命令）。
+        String dedupKey = inboundKey(type, event);
+        if (dedupKey != null && engine.isInboundSeen(dedupKey)) {
+            log("[事件] 重复事件已忽略：" + dedupKey);
+            return;
+        }
         switch (type) {
             case "C2C_MESSAGE_CREATE":      handleC2c(event);      break;
             case "GROUP_AT_MESSAGE_CREATE": handleGroupAt(event);  break;
@@ -300,6 +332,15 @@ public class QqBot {
             case "GROUP_AND_C2C_EVENT":     /* 群/单聊事件，暂时忽略 */ break;
             default: log("[事件] 忽略事件类型: " + type);
         }
+        // 业务处理成功后才写入去重标记：崩溃窗口只可能重复一次，不会丢消息。
+        if (dedupKey != null) engine.markInbound(dedupKey, System.currentTimeMillis());
+    }
+
+    /** C2C / 群@ 消息的事件幂等键（type + message id）；其它事件返回 null。 */
+    private static String inboundKey(String type, JsonObject event) {
+        if (!"C2C_MESSAGE_CREATE".equals(type) && !"GROUP_AT_MESSAGE_CREATE".equals(type)) return null;
+        String id = opt(d(event), "id");
+        return (id == null || id.isEmpty()) ? null : type + ":" + id;
     }
 
     private void handleC2c(JsonObject event) {
@@ -376,16 +417,7 @@ public class QqBot {
     /** 执行一条命令，把输出聚合成单条回复文本。 */
     private String runCommand(String line) {
         StringBuilder sb = new StringBuilder();
-        Consumer<String> old = engine.getOutput();
-        engine.setOutput(s -> { if (sb.length() > 0) sb.append("\n"); sb.append(s); });
-        try {
-            // QQ 侧增强命令优先处理；未命中则交给共享的 TaskEngine。
-            if (!qqCommand(line, sb)) {
-                engine.execute(line);
-            }
-        } finally {
-            engine.setOutput(old);
-        }
+        if (!qqCommand(line, sb)) sb.append(engine.executeFor(line, "qq"));
         return sb.length() == 0 ? "（无输出）" : sb.toString();
     }
 
@@ -418,7 +450,7 @@ public class QqBot {
         long now = System.currentTimeMillis();
         String sql = "SELECT COUNT(*) AS total,"
                 + " SUM(CASE WHEN status != 'removed' THEN 1 ELSE 0 END) AS active,"
-                + " SUM(CASE WHEN status != 'removed' AND last_notified_at IS NULL AND ("
+                + " SUM(CASE WHEN status NOT IN ('done','removed') AND last_notified_at IS NULL AND ("
                 + "   (remind_at IS NOT NULL AND remind_at <= ?) OR (trigger_at IS NOT NULL AND trigger_at <= ?)"
                 + " ) THEN 1 ELSE 0 END) AS due"
                 + " FROM tasks";
@@ -462,9 +494,15 @@ public class QqBot {
         }
     }
 
-    /** 发送单聊消息到用户 openid。 */
-    private void sendC2c(String openid, String text) {
-        if (openid == null || openid.isEmpty() || text == null || text.isEmpty()) return;
+    /** HTTP 响应结果（BUG-016）：ok 同时覆盖 HTTP 状态码与 QQ 业务错误字段。 */
+    record SendResult(boolean ok, int statusCode, String body, String error) {}
+
+    /**
+     * 发送单聊消息。返回是否真正发送成功。
+     * <p>BUG-016（2026-10-21 修复）：原实现只返回 body、从不看 statusCode，401/429/500 全走成功路径。
+     */
+    private boolean sendC2c(String openid, String text) {
+        if (openid == null || openid.isEmpty() || text == null || text.isEmpty()) return false;
         try {
             String token = accessToken();
             String url = "https://api.sgroup.qq.com/v2/users/" + urlenc(openid) + "/messages";
@@ -473,16 +511,23 @@ public class QqBot {
                     "msg_seq", (int) (System.currentTimeMillis() % 10000),
                     "content", text,
                     "openid", openid));
-            String r = postText(url, body, "application/json", "QQBot " + token);
-            log("[发送→私聊] " + openid + " :: " + text + (verbose ? "  resp=" + r : ""));
+            SendResult r = postJson(url, body, "application/json", "QQBot " + token);
+            if (!r.ok()) {
+                log("[错误] 发送私聊失败 " + openid + " HTTP " + r.statusCode() + ": " + r.error()
+                        + (verbose ? "  body=" + r.body() : ""));
+                return false;
+            }
+            log("[发送→私聊] " + openid + " :: " + text + (verbose ? "  resp=" + r.body() : ""));
+            return true;
         } catch (Exception e) {
             log("[错误] 发送私聊失败: " + e.getMessage());
+            return false;
         }
     }
 
-    /** 发送群消息到 group_openid。 */
-    private void sendGroup(String group, String text) {
-        if (group == null || group.isEmpty() || text == null || text.isEmpty()) return;
+    /** 发送群消息到 group_openid。返回是否真正发送成功（BUG-016）。 */
+    private boolean sendGroup(String group, String text) {
+        if (group == null || group.isEmpty() || text == null || text.isEmpty()) return false;
         try {
             String token = accessToken();
             String url = "https://api.sgroup.qq.com/v2/groups/" + urlenc(group) + "/messages";
@@ -491,15 +536,22 @@ public class QqBot {
                     "msg_seq", System.currentTimeMillis() % 10000L,
                     "content", text,
                     "group_openid", group));
-            String r = postText(url, body, "application/json", "QQBot " + token);
-            log("[群消息发送] " + group + " :: " + text + (verbose ? "  resp=" + r : ""));
+            SendResult r = postJson(url, body, "application/json", "QQBot " + token);
+            if (!r.ok()) {
+                log("[错误] 发送群消息失败 " + group + " HTTP " + r.statusCode() + ": " + r.error()
+                        + (verbose ? "  body=" + r.body() : ""));
+                return false;
+            }
+            log("[群消息发送] " + group + " :: " + text + (verbose ? "  resp=" + r.body() : ""));
+            return true;
         } catch (Exception e) {
             log("[错误] 发送群消息失败: " + e.getMessage());
+            return false;
         }
     }
 
-    /** POST 返回文本响应。 */
-    private String postText(String url, String body, String contentType, String auth)
+    /** POST JSON 并判定成功（HTTP 2xx 且无业务错误字段）。包级可见：供离线回归测试直接验证。 */
+    SendResult postJson(String url, String body, String contentType, String auth)
             throws Exception {
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
                 .timeout(Duration.ofSeconds(20))
@@ -507,7 +559,28 @@ public class QqBot {
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
         if (auth != null) b.header("Authorization", auth);
         HttpResponse<String> resp = http.send(b.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        return resp.body();
+        int code = resp.statusCode();
+        String respBody = resp.body();
+        if (code / 100 != 2) return new SendResult(false, code, respBody, "HTTP " + code);
+        String businessError = businessError(respBody);
+        if (businessError != null) return new SendResult(false, code, respBody, businessError);
+        return new SendResult(true, code, respBody, "");
+    }
+
+    /** QQ 业务错误：HTTP 200 也可能携带 code/err_code 非 0。 */
+    private static String businessError(String body) {
+        try {
+            JsonObject o = JsonParser.parseString(body).getAsJsonObject();
+            for (String k : new String[]{"code", "err_code"}) {
+                if (o.has(k) && !o.get(k).isJsonNull()) {
+                    long v = o.get(k).getAsLong();
+                    if (v != 0) return "code=" + v + " " + opt(o, "message");
+                }
+            }
+        } catch (Exception ignore) {
+            // 非 JSON（例如网关错误页）→ 不判业务错误，交给 HTTP 状态码判定
+        }
+        return null;
     }
 
     private static String urlenc(String s) throws Exception {
@@ -587,44 +660,62 @@ public class QqBot {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             running = false;
             timer.shutdown();
+            engine.shutdownTiming(this::log);
             if (server != null) server.stop(0);
         }));
     }
 
     /** 扫描到期任务并通知（幂等，避免重复）。 */
     private void checkReminders() {
+        engine.timingTick(message -> {
+            log(message);
+            if (messagingUp) pushToQQ(message);
+        });
         // 使用 ReminderService 相同的SQL逻辑
-        String sql = "SELECT id,title,note,remind_at,last_notified_at FROM tasks WHERE status!='removed' AND ( (remind_at IS NOT NULL AND remind_at<=?) OR (trigger_at IS NOT NULL AND trigger_at<=?) )";
+        // BUG-007（2026-10-19 修复）：必须排除 done，否则已完成的任务到 DDL 仍会被推送。
+        // 注意：本处与 ReminderService 是两个独立扫描器，必须同时改，否则两套运行方式行为不一致。
+        String sql = "SELECT id,title,note,remind_at,last_notified_at FROM tasks WHERE status NOT IN ('done','removed') AND ( (remind_at IS NOT NULL AND remind_at<=?) OR (trigger_at IS NOT NULL AND trigger_at<=?) )";
         long now = System.currentTimeMillis();
+        Set<String> seen = new HashSet<>();
         try (Connection c = conn(); PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setLong(1, now);
             ps.setLong(2, now);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     String id = rs.getString("id");
-                    String title = rs.getString("title");
-                    String note = rs.getString("note");
-                    long remindAt = rs.getLong("remind_at");
+                    seen.add(id);
                     long lastNotified = rs.getLong("last_notified_at");
-                    
+
                     // 不重复判定：last_notified_at IS NULL = 该提醒尚未通知 → 补发
                     // 已通知则跳过。这比"5分钟窗口"更贴合"重启补发且不重复"
                     if (lastNotified != 0) {
                         continue;
                     }
-                    
-                    String line = buildRemindText(title, note, remindAt);
-                    // 本地弹窗 + 出声
-                    localAlert(line);
-                    // QQ 推送
-                    pushToQQ(line);
+                    // BUG-027：推送失败的提醒按退避重试，不每 10 秒刷屏
+                    if (!pacing.shouldAttempt(id, now)) {
+                        continue;
+                    }
 
-                    // 触发后更新 last_notified_at，WHERE 保证并发下也只写一次
-                    markNotified(c, id, now);
-                    // 成功也记一笔，否则「提醒到底有没有触发」无法从日志判断
-                    log("[提醒] 已触发: " + title);
+                    String title = rs.getString("title");
+                    String note = rs.getString("note");
+                    long remindAt = rs.getLong("remind_at");
+                    String line = buildRemindText(title, note, remindAt);
+                    // 本地弹窗：每个任务只弹一次（重试推送时不再重复打扰）
+                    if (pacing.markAlerted(id)) localAlert(line);
+
+                    // BUG-027（附六 §6.5）：推送成功才写 last_notified_at；
+                    // 失败则保留未提醒状态，下一轮重试（而不是把提醒永久烧掉）。
+                    boolean delivered = !messagingUp || pushToQQ(line);
+                    if (delivered && markNotified(c, id, now)) {
+                        pacing.onSuccess(id);
+                        log("[提醒] 已触发: " + title);
+                    } else {
+                        pacing.onFailure(id, now);
+                        log("[提醒] 推送/标记失败，稍后重试: " + title);
+                    }
                 }
             }
+            pacing.retain(seen);
         } catch (Exception e) {
             log("[提醒] 扫描失败: " + e.getMessage());
         }
@@ -657,9 +748,13 @@ public class QqBot {
         try { Toolkit.getDefaultToolkit().beep(); } catch (Throwable ignore) {}
     }
 
-    /** 通过 QQ 机器人把提醒发给已登记目标。 */
-    private void pushToQQ(String text) {
-        if (remindTargets.isEmpty()) { log("[提醒] 未配置 remind.to，跳过 QQ 推送"); return; }
+    /**
+     * 通过 QQ 机器人把提醒发给已登记目标。
+     * @return 是否全部成功；未配置任何目标时返回 true（没有可投递的通道）
+     */
+    private boolean pushToQQ(String text) {
+        if (remindTargets.isEmpty()) { log("[提醒] 未配置 remind.to，跳过 QQ 推送"); return true; }
+        boolean allOk = true;
         for (String target : remindTargets) {
             // 前缀分隔符容忍 : 与 . 两种写法（user:xxx / user.xxx），避免配置手误导致静默不推送
             String kind, id;
@@ -668,34 +763,46 @@ public class QqBot {
             int sep = (c >= 0 && (dot < 0 || c < dot)) ? c : dot;
             if (sep < 0) {
                 log("[提醒] 未知目标格式(需 user: 或 group: 前缀): " + target);
+                allOk = false;
                 continue;
             }
             kind = target.substring(0, sep).trim().toLowerCase();
             id = target.substring(sep + 1).trim();
             if (id.isEmpty()) {
                 log("[提醒] 目标缺少 openid: " + target);
+                allOk = false;
                 continue;
             }
-            if ("group".equals(kind)) sendGroup(id, text);
-            else if ("user".equals(kind)) sendC2c(id, text);
-            else log("[提醒] 未知目标类型(需 user/group): " + target);
+            if ("group".equals(kind)) {
+                if (!sendGroup(id, text)) allOk = false;
+            } else if ("user".equals(kind)) {
+                if (!sendC2c(id, text)) allOk = false;
+            } else {
+                log("[提醒] 未知目标类型(需 user/group): " + target);
+                allOk = false;
+            }
         }
+        return allOk;
     }
 
-    /** 对外暴露的提醒推送入口：把文本推给已登记目标（供 Main 的 ReminderService 回调调用）。 */
-    public void pushRemind(String text) {
-        pushToQQ(text);
+    /**
+     * 对外暴露的提醒推送入口。
+     * @return 是否推送成功；供 ReminderService 决定要不要写 last_notified_at（BUG-027）
+     */
+    public boolean pushRemind(String text) {
+        return pushToQQ(text);
     }
 
-    /** 更新 last_notified_at，防止重复提醒。 */
-    private void markNotified(Connection c, String id, long now) {
+    /** 更新 last_notified_at，防止重复提醒。@return 是否真的写入（行数=1） */
+    private boolean markNotified(Connection c, String id, long now) {
         try (PreparedStatement ps = c.prepareStatement(
                 "UPDATE tasks SET last_notified_at=? WHERE id=? AND last_notified_at IS NULL")) {
             ps.setLong(1, now);
             ps.setString(2, id);
-            ps.executeUpdate();
+            return ps.executeUpdate() == 1;
         } catch (Exception e) {
             log("[提醒] 记录通知失败: " + e.getMessage());
+            return false;
         }
     }
 }

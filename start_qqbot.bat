@@ -8,7 +8,8 @@ REM  作用：校验环境 -> 编译 -> 启动 QqBot 主类
 REM  用法：双击运行，或在命令行执行 start_qqbot.bat
 REM ============================================================
 
-set "PROJ=D:\Java\TaskMgr"
+set "PROJ=%~dp0"
+if "%PROJ:~-1%"=="\" set "PROJ=%PROJ:~0,-1%"
 set "M2=%USERPROFILE%\.m2\repository"
 set "OUT=%PROJ%\target\classes"
 
@@ -53,17 +54,9 @@ if errorlevel 1 (
 )
 echo [3/5] 配置文件 OK
 
-REM ---------- 4. 编译 ----------
+REM ---------- 4. 编译（唯一入口：build.bat，含源码/资源统一处理） ----------
 echo [4/5] 正在编译...
-if not exist "%OUT%" mkdir "%OUT%" >nul 2>&1
-
-copy /Y "%CONF%" "%OUT%\qqbot.properties" >nul
-
-javac -encoding UTF-8 --add-modules jdk.httpserver ^
-  -cp "%GSON%;%SQLITE%;%SLF4J%" ^
-  -d "%OUT%" ^
-  "%PROJ%\src\main\java\*.java"
-
+call "%PROJ%\build.bat"
 if errorlevel 1 (
     echo [错误] 编译失败，请看上面的 javac 报错。
     goto :fail
