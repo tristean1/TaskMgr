@@ -307,7 +307,14 @@ public class QqBot {
         String openid = optPath(d, "author.user_openid");
         if (openid == null) openid = opt(d, "user_openid");
         String content = opt(d, "content");
-        if (openid == null || content == null) return;
+        // BUG-006 诊断：此前这里直接 return，导致"消息没被处理"完全无迹可寻。
+        // 现在把丢弃原因和原文（截断）都记下来，便于判断是字段结构不符还是真的没收到。
+        if (openid == null || content == null) {
+            log("[C2C] ⚠️ 丢弃一条单聊事件：openid=" + (openid == null ? "null" : openid)
+                    + " content=" + (content == null ? "null" : "\"" + content + "\"")
+                    + " 原文=" + brief(d.toString()));
+            return;
+        }
         log("[C2C] 来自 " + openid + ": " + content);
         String reply = runCommand(content.trim());
         sendC2c(openid, reply);

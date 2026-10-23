@@ -59,6 +59,8 @@ public class QqWsClient {
     /** 恢复登录态所需（断线重连时复用）。 */
     private volatile String sessionId;
     private volatile String resumeGatewayUrl;
+    /** 会话持久化（用户需求）：进程重启后仍能先尝试 Resume。可为 null（关闭持久化）。 */
+    private final WsSessionStore sessionStore;
 
     private volatile WebSocket ws;
     private ScheduledExecutorService heartbeatTimer;
@@ -87,9 +89,64 @@ public class QqWsClient {
     public QqWsClient(TokenSupplier tokenSupplier,
                       BiConsumer<String, JsonObject> onEvent,
                       java.util.function.Consumer<String> logger) {
+        this(tokenSupplier, onEvent, logger, new WsSessionStore());
+    }
+
+    /** 允许注入会话存储（便于测试；传 null 则关闭持久化）。 */
+    public QqWsClient(TokenSupplier tokenSupplier,
+                      BiConsumer<String, JsonObject> onEvent,
+                      java.util.function.Consumer<String> logger,
+                      WsSessionStore sessionStore) {
         this.tokenSupplier = tokenSupplier;
         this.onEvent = onEvent;
         this.logger = logger;
+        this.sessionStore = sessionStore;
+        restoreSession();
+    }
+
+    /**
+     * 启动时把上次保存的会话读回来，<b>于是第一次连接就会优先尝试 Resume</b>。
+     * <p>
+     * 这正是用户要的效果："每次连接成功后记录 session，之后不论发生什么，
+     * 下次连接先尝试用它恢复"。若 QQ 侧已回收该会话，Resume 会失败并自动退回全新登录。
+     */
+    private void restoreSession() {
+        if (sessionStore == null) return;
+        WsSessionStore.Session s = sessionStore.load();
+        if (s == null) return;
+        this.sessionId = s.sessionId;
+        if (s.gatewayUrl != null) this.resumeGatewayUrl = s.gatewayUrl;
+        if (s.seq >= 0) {
+            this.lastSeq.set(s.seq);
+            this.hasSeq = true;
+        }
+        log("[WS] 已载入上次保存的会话 session_id=" + shortId(s.sessionId)
+                + " seq=" + s.seq + "，本次将优先尝试 Resume");
+    }
+
+    /** 保存当前会话（READY / RESUMED / 事件推进 seq 时调用）。 */
+    private void persistSession() {
+        if (sessionStore == null) return;
+        String sid = sessionId;
+        if (sid == null || sid.isEmpty()) return;
+        sessionStore.save(sid, hasSeq ? lastSeq.get() : -1, resumeGatewayUrl);
+    }
+
+    /** 清掉持久化会话（session 被判定无效时必须调用，否则会反复用坏 session 重试）。 */
+    private void dropPersistedSession() {
+        if (sessionStore != null) sessionStore.clear();
+    }
+
+    private static String shortId(String id) {
+        if (id == null) return "(null)";
+        return id.length() <= 8 ? id : id.substring(0, 8) + "…";
+    }
+
+    /** 截断 JSON 便于日志（仅诊断用）。 */
+    private static String briefJson(Object o) {
+        if (o == null) return "(null)";
+        String s = String.valueOf(o).replaceAll("\\s+", " ");
+        return s.length() <= 400 ? s : s.substring(0, 400) + "…";
     }
 
     // ───────────────────────── 对外生命周期 ─────────────────────────
@@ -290,7 +347,11 @@ public class QqWsClient {
         // 新连接的存活基准从这里开始计，避免刚建连就被误判
         lastInboundAt = System.currentTimeMillis();
 
-        heartbeatTimer.scheduleAtFixedRate(() -> {
+        // ⚠️ 必须用 scheduleWithFixedDelay 而非 scheduleAtFixedRate：
+        // 电脑休眠时进程被挂起，定时器会"欠下"大量未执行的任务（实测 33507s / 33s ≈ 1015 次）。
+        // scheduleAtFixedRate 会在唤醒后**一次性全部补跑**，导致日志刷屏上千行；
+        // scheduleWithFixedDelay 只按"上一次结束后再等 period"，不会补跑。
+        heartbeatTimer.scheduleWithFixedDelay(() -> {
             // 连接换代后旧定时器不得再发（避免往已关闭连接写数据）
             if (gen != connectionGeneration || closed.get()) return;
 
@@ -302,11 +363,19 @@ public class QqWsClient {
             if (lastInboundAt > 0 && silent > inboundTimeout) {
                 log("[WS] 已 " + (silent / 1000) + "s 未收到任何服务端帧（含心跳 ACK），"
                         + "判定连接已僵死，主动断开以促使 QQ 标记离线并排队消息（代数 " + gen + "）");
+                // ① 先停掉本连接的心跳定时器，避免判定后继续重复刷屏
+                stopHeartbeatIfCurrent(gen);
+                // ② 主动解除 awaitClose 的等待。
+                //    不能只依赖 abort() 触发 onClose/onError —— 实测对已僵死的连接
+                //    这两个回调可能都不触发，那样 connectOnce 永不返回，runForever
+                //    也就永远不会重连（本次事故即如此）。
+                signalClosed(gen);
+                // ③ 再关连接（幂等，失败无所谓）
                 WebSocket dead = ws;
                 if (dead != null) {
                     try { dead.abort(); } catch (Throwable ignore) {}
                 }
-                return; // abort 会触发 onClose/onError → 交回 runForever 重连
+                return;
             }
 
             try {
@@ -441,11 +510,13 @@ public class QqWsClient {
                 // 否则会陷入「Resume → 2 分钟后 4009 → 再 Resume」的死循环（实测如此）。
                 resumeFailures++;
                 if (resumeFailures >= 2) {
-                    log("[WS] Resume 连续失败 " + resumeFailures + " 次，改为全新 Identify");
+                    log("[WS] Resume 连续失败 " + resumeFailures + " 次，判定会话已失效，"
+                            + "清除本地会话并改为全新 Identify");
                     sessionId = null;
                     resumeGatewayUrl = null;
                     hasSeq = false;
                     resumeFailures = 0;
+                    dropPersistedSession();   // 会话确实失效 → 持久化记录也必须清掉
                 }
             } else if (statusCode == 1006 || statusCode == 1005 || statusCode == 1001) {
                 // P2：网络层异常断开（1006 等）不立刻清 session —— 先尝试 Resume，
@@ -457,6 +528,7 @@ public class QqWsClient {
                     resumeGatewayUrl = null;
                     hasSeq = false;
                     resumeFailures = 0;
+                    dropPersistedSession();
                 }
             } else if (statusCode != WebSocket.NORMAL_CLOSURE) {
                 // 会话无效，下次全新登录
@@ -464,6 +536,7 @@ public class QqWsClient {
                 resumeGatewayUrl = null;
                 hasSeq = false;
                 resumeFailures = 0;
+                dropPersistedSession();
             }
             signalClosed(myGen);
             return null;
@@ -518,24 +591,40 @@ public class QqWsClient {
                     }
                     String t = msg.has("t") && !msg.get("t").isJsonNull()
                             ? msg.get("t").getAsString() : null;
-                    if (t == null) break;
+                    // BUG-006 诊断：此前 t 为 null 会静默丢弃，无法判断"QQ 没发"还是"我们丢了"。
+                    // 现在把**每一个** Dispatch 事件都打出来（含 seq），事件频率极低，不会刷屏。
+                    if (t == null) {
+                        log("[事件] 收到无类型 Dispatch（seq=" + (hasSeq ? lastSeq.get() : -1)
+                                + "），无法分发，原文=" + briefJson(msg));
+                        persistSession();
+                        break;
+                    }
+                    log("[事件] seq=" + (hasSeq ? lastSeq.get() : -1) + "  t=" + t);
                     if ("READY".equals(t)) {
                         JsonObject d = msg.has("d") && msg.get("d").isJsonObject()
                                 ? msg.getAsJsonObject("d") : new JsonObject();
                         if (d.has("session_id")) sessionId = d.get("session_id").getAsString();
                         reconnectAttempt = 0; // 登录成功，重置退避
                         resumeFailures = 0;   // 登录成功即视为 Resume 链路正常
-                        log("[WS] 鉴权成功 READY，session_id=" + sessionId);
+                        // 会话持久化：新建的 session 立刻落盘，供进程重启后 Resume
+                        persistSession();
+                        log("[WS] 鉴权成功 READY，session_id=" + sessionId
+                                + "（已保存会话，seq=" + (hasSeq ? lastSeq.get() : -1) + "）");
                         break;
                     }
                     if ("RESUMED".equals(t)) {
                         reconnectAttempt = 0;
                         resumeFailures = 0;   // Resume 成功，清零失败计数
-                        log("[WS] 会话已恢复 RESUMED");
+                        // 会话持久化：Resume 后 seq 可能已推进，刷新一次
+                        persistSession();
+                        log("[WS] 会话已恢复 RESUMED（seq=" + (hasSeq ? lastSeq.get() : -1) + "）");
                         break;
                     }
                     JsonObject d = msg.has("d") && msg.get("d").isJsonObject()
                             ? msg.getAsJsonObject("d") : new JsonObject();
+                    // 会话持久化：每收到一个事件就刷新 seq，保证重启后 Resume 不漏事件。
+                    // 事件频率极低（只在用户真的操作时才有），落盘开销可忽略。
+                    persistSession();
                     // 交给上层（QqBot 的 dispatchEvent 逻辑）
                     try {
                         onEvent.accept(t, d);
@@ -555,9 +644,10 @@ public class QqWsClient {
                     signalClosed(myGen);
                     break;
                 case 9: // Invalid Session：需重新 Identify
-                    log("[WS] 会话无效，将重新登录");
+                    log("[WS] 会话无效，将重新登录（并清除本地保存的会话，避免反复用失效 session 重试）");
                     sessionId = null;
                     hasSeq = false;
+                    dropPersistedSession();
                     break;
                 default:
                     log("[WS] 未处理 opcode=" + op);
