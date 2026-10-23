@@ -42,4 +42,6 @@ replay_pid*
 # 需求文档、决策记录、使用观察等个人档案：只保留在本地磁盘，永不提交。
 # REQUIREMENTS*.md 同时覆盖 REQUIREMENTS.md 与 REQUIREMENTS_TIMING.md
 REQUIREMENTS*.md
+# AGENTS.md 必须留在仓库根目录才会被工作区自动加载，所以只忽略、不挪位置
+AGENTS.md
 local-docs/
