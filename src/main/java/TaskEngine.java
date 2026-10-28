@@ -1,6 +1,8 @@
 import java.sql.*;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.function.Consumer;
 
@@ -201,6 +203,8 @@ public class TaskEngine {
             case "ls":        handleList(argv);  break;
             case "done":      handleSetStatus(argv, "done");    break;
             case "remove":    handleSetStatus(argv, "removed"); break;
+            case "push":      handlePush(argv);  break;
+            case "set":       handleSet(argv);   break;
             case "undo":      handleUndo();  break;
             case "export":    handleExport(argv);      break;
             case "nl":        handleNl(argv);    break;
@@ -854,6 +858,235 @@ public class TaskEngine {
         return active == null ? "" : "\n[提示] 注意：「" + active.label() + "」仍在计时。" + workTimer.describe(active);
     }
 
+// ─────────────────────────── push：平移任务时间（REQ-016） ───────────────────────────
+
+    /** push 省略增量时的默认值：一天。 */
+    private static final long PUSH_DEFAULT_DELTA_MS = 24L * 3600L * 1000L;
+
+    /**
+     * push [任务名] [增量]：把任务的 DDL / 提醒时间整体平移（REQ-016，2026-10-26）。
+     *
+     * <p>口径（用户 2026-10-26 拍板）：
+     * <ul>
+     *   <li>增量正数 = 推迟（{@code push 1h}），负数 = 提前（{@code push -30m}），
+     *       省略 = 推迟一天。单位 d/h/m/s，可组合（{@code 1d12h}），<b>必须带单位</b>。</li>
+     *   <li>不写任务名时，目标与 {@code done}/{@code remove} 完全同一套取法
+     *       （见 {@link #resolveBareTarget()}）。</li>
+     *   <li>同时有 DDL 与提醒时间时两个都平移，因此「提前多久提醒」的间距保持不变。</li>
+     *   <li>原本没有时间的任务：按「现在 + 增量」补一个 DDL（负增量会落在过去，直接拒绝）。</li>
+     *   <li>调整后任何时间落在现在或之前 → 拒绝，<b>不制造过去的时间</b>。</li>
+     * </ul>
+     *
+     * <p>为什么时间一变就清空 {@code last_notified_at}：两个提醒扫描器都靠这一列判断
+     * 「这条提醒过了」（非 0 就跳过），不清空等于新时间永不提醒。原来是给旧时间发的提醒，
+     * 顺带作废也更合理。
+     */
+    private void handlePush(String[] argv) {
+        try {
+            out.accept(SqlTransaction.run(conn, () -> pushShift(argv)));
+        } catch (SQLException e) {
+            out.accept("[错误] push 失败（未提交）：" + e.getMessage());
+        }
+    }
+
+    /** {@link #handlePush} 的事务体；只在构造完整回执后返回，抛异常即整体回滚。 */
+    private String pushShift(String[] argv) throws SQLException {
+        long now = clock.millis();
+
+        // ─── 1) 拆增量与任务名：增量可以写在末尾，也可以写在最前 ───
+        long delta = PUSH_DEFAULT_DELTA_MS;
+        String deltaText = null;
+        int from = 0;
+        int to = argv.length;
+        if (argv.length > 0 && looksLikePushDelta(argv[argv.length - 1])) {
+            deltaText = argv[argv.length - 1];
+            to = argv.length - 1;
+        } else if (argv.length > 0 && looksLikePushDelta(argv[0])) {
+            deltaText = argv[0];
+            from = 1;
+        }
+        List<String> titleToks = new ArrayList<>();
+        for (int i = from; i < to; i++) {
+            if (argv[i].startsWith("-")) {
+                return "[错误] push 不认识的参数：" + argv[i]
+                        + "\n        用法：push [任务名] [增量]，增量形如 1h / 2d / 1d12h / -30m（省略则推迟一天）";
+            }
+            titleToks.add(argv[i]);
+        }
+        if (deltaText == null && titleToks.size() > 1) {
+            String last = titleToks.get(titleToks.size() - 1);
+            if (last.matches("[+-]?\\d+[a-zA-Z]+")) {
+                return "[提示] 增量单位只能是 d / h / m / s（也可以写 天 / 小时 / 分 / 秒）：" + last;
+            }
+        }
+        if (deltaText != null) {
+            try {
+                delta = parsePushDeltaMillis(deltaText);
+            } catch (RuntimeException e) {
+                return "[提示] 增量无法解析：" + deltaText + "（形如 1h / 2d / -30m，数字后面必须带 d h m s）";
+            }
+        }
+        if (delta == 0) return "[提示] 增量为 0，没有任何改动。";
+
+        // ─── 2) 定位目标：不写名字就沿用 done/remove 的取法 ───
+        String id;
+        String title;
+        if (titleToks.isEmpty()) {
+            String[] target = resolveBareTarget();
+            if (target == null) return "[提示] 没有可调整时间的任务（发 next 看看下一步）";
+            id = target[0];
+            title = target[1];
+        } else {
+            String wanted = String.join(" ", titleToks);
+            id = null;
+            title = wanted;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT id, title FROM tasks WHERE title=? AND status NOT IN ('done','removed') "
+                            + "ORDER BY created_at DESC LIMIT 1")) {
+                ps.setString(1, wanted);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        id = rs.getString("id");
+                        title = rs.getString("title");
+                    }
+                }
+            }
+            if (id == null) return "[提示] 未找到未完成任务: \"" + wanted + "\"";
+        }
+
+        // ─── 3) 读当前时间 ───
+        Long triggerAt;
+        Long remindAt;
+        long lastNotified;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT trigger_at, remind_at, last_notified_at FROM tasks WHERE id=?")) {
+            ps.setString(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return "[提示] 任务不存在（可能已被删除）：\"" + title + "\"";
+                triggerAt = readNullableLong(rs, "trigger_at");
+                remindAt = readNullableLong(rs, "remind_at");
+                lastNotified = rs.getLong("last_notified_at");
+            }
+        }
+        boolean timeless = triggerAt == null && remindAt == null;
+
+        // ─── 4) 算新时间 ───
+        Long newTrigger;
+        Long newRemind;
+        try {
+            if (timeless) {
+                if (delta < 0) {
+                    return "[提示] 「" + title + "」原本没有时间，负增量会落在过去，拒绝设置。";
+                }
+                newTrigger = Math.addExact(now, delta);
+                newRemind = null;
+            } else {
+                newTrigger = triggerAt == null ? null : Math.addExact(triggerAt, delta);
+                newRemind = remindAt == null ? null : Math.addExact(remindAt, delta);
+            }
+        } catch (ArithmeticException overflow) {
+            return "[提示] 增量太大，调整后的时间已经溢出。";
+        }
+
+        // ─── 5) 不制造过去的时间 ───
+        if (newTrigger != null && newTrigger <= now) {
+            return "[提示] 调整后的 DDL 在过去：" + fmtEpoch(newTrigger)
+                    + "（现在 " + fmtEpoch(now) + "），已拒绝。";
+        }
+        if (newRemind != null && newRemind <= now) {
+            return "[提示] 调整后的提醒时间在过去：" + fmtEpoch(newRemind)
+                    + "（现在 " + fmtEpoch(now) + "），已拒绝。";
+        }
+
+        // ─── 6) 落库 + 记账（可 undo） ───
+        String beforeJson = rowToJson(id);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE tasks SET trigger_at=?, remind_at=?, last_notified_at=NULL, updated_at=? "
+                        + "WHERE id=? AND status='todo'")) {
+            setNullableLong(ps, 1, newTrigger);
+            setNullableLong(ps, 2, newRemind);
+            ps.setLong(3, now);
+            ps.setString(4, id);
+            if (ps.executeUpdate() != 1) throw new SQLException("目标任务已不是 TODO，可能刚被完成或删除");
+        }
+        opLog.recordUpdateStrict(id, "push", beforeJson, rowToJson(id));
+        markShown(id);
+
+        // ─── 7) 回显 ───
+        StringBuilder sb = new StringBuilder();
+        sb.append("[OK] 「").append(title).append("」")
+                .append(delta > 0 ? "推迟 " : "提前 ").append(describeDelta(delta));
+        if (timeless) {
+            sb.append("\n     原本没有时间，已设为：").append(fmtEpoch(newTrigger));
+        } else {
+            if (triggerAt != null) {
+                sb.append("\n     DDL  ").append(fmtEpoch(triggerAt))
+                        .append(" → ").append(fmtEpoch(newTrigger));
+            }
+            if (remindAt != null) {
+                sb.append("\n     提醒 ").append(fmtEpoch(remindAt))
+                        .append(" → ").append(fmtEpoch(newRemind));
+            }
+        }
+        if (lastNotified != 0) sb.append("\n     提醒已重新武装：新时间到了会再提醒一次");
+        return sb.toString();
+    }
+
+    /** 是否是 push 的增量写法：{@code 1h}、{@code 2d}、{@code 1d12h}、{@code -30m}、{@code +1h}、{@code 3天}。 */
+    private static boolean looksLikePushDelta(String s) {
+        return s != null && normalizeDeltaText(s).matches("[+-]?(?:\\d+[dhms])+");
+    }
+
+    /**
+     * 中文单位归一化成 ASCII：天→d、小时→h、分/分钟→m、秒→s。
+     * <p>只对「整个 token 就是增量」的写法生效，所以不会误伤标题里的字。
+     */
+    private static String normalizeDeltaText(String s) {
+        return s.replace("小时", "h")
+                .replace("分钟", "m")
+                .replace("天", "d")
+                .replace("分", "m")
+                .replace("秒", "s");
+    }
+
+    /**
+     * 解析 push 增量；负号表示提前。
+     * <p>复用 {@link #parseIncrementMillis(String)}：单位与溢出保护都在那一份里，不重复实现。
+     */
+    private static long parsePushDeltaMillis(String s) {
+        String normalized = normalizeDeltaText(s);
+        boolean negative = normalized.startsWith("-");
+        long v = parseIncrementMillis(normalized);
+        return negative ? -v : v;
+    }
+
+    /** 把增量毫秒渲染成「1 天 12 小时」这种给人看的形式（秒只在不足一天时显示）。 */
+    private static String describeDelta(long deltaMillis) {
+        long a = Math.abs(deltaMillis);
+        long days = a / 86_400_000L;
+        long hours = a % 86_400_000L / 3_600_000L;
+        long minutes = a % 3_600_000L / 60_000L;
+        long seconds = a % 60_000L / 1000L;
+        StringBuilder sb = new StringBuilder();
+        if (days > 0) sb.append(days).append(" 天");
+        if (hours > 0) sb.append(hours).append(" 小时");
+        if (minutes > 0) sb.append(minutes).append(" 分");
+        if (seconds > 0 && days == 0) sb.append(seconds).append(" 秒");
+        return sb.length() == 0 ? "0 秒" : sb.toString();
+    }
+
+    /** 读可空的时间列（SQLite 用 NULL 表示「没有时间」）。 */
+    private static Long readNullableLong(ResultSet rs, String column) throws SQLException {
+        long v = rs.getLong(column);
+        return rs.wasNull() ? null : v;
+    }
+
+    /** 写可空的时间列。 */
+    private static void setNullableLong(PreparedStatement ps, int index, Long v) throws SQLException {
+        if (v == null) ps.setNull(index, Types.INTEGER);
+        else ps.setLong(index, v);
+    }
+
     /** 是否存在未完成未删除的同名任务。 */
     private boolean hasActiveTask(String title) {
         String sql = "SELECT COUNT(*) FROM tasks WHERE title=? AND status NOT IN ('done','removed')";
@@ -865,6 +1098,226 @@ public class TaskEngine {
         } catch (SQLException e) {
             return false;
         }
+    }
+
+    // ─────────────────────────── set：修改已有任务的属性（REQ-017） ───────────────────────────
+
+    /** `set` 的用法文案，报错与 help 共用一份，避免两处漂移。 */
+    private static final String SET_USAGE =
+            "用法：set [任务名] [-t DDL] [-a 提醒] [-p 1-9] [-title 新标题] [-n 备注]\n"
+          + "       不写任务名时取法与 done/remove/push 一致；只改你写出来的那几项；-n 必须放最后";
+
+    /**
+     * set [任务名] [开关…]：修改**已有**任务的 DDL / 提醒 / 优先级 / 标题 / 备注（REQ-017，2026-10-28）。
+     *
+     * <p>三个命令的分工：{@code add} 建任务，{@code push} 相对平移时间，{@code set} 按绝对值改任一可改字段。
+     * 开关语法与 {@code add} 保持一致（{@code -t/-a/-p/-n}，另加 {@code -title}），
+     * 时间写法直接复用 {@link #parseTimeToEpochMillis(String)}，不另立一套。
+     *
+     * <p>只在时间**真的变了**时才清空 {@code last_notified_at}：改优先级或改错别字
+     * 不该让已经提醒过的任务再响一次。
+     */
+    private void handleSet(String[] argv) {
+        try {
+            out.accept(SqlTransaction.run(conn, () -> setFields(argv)));
+        } catch (SQLException e) {
+            out.accept("[错误] set 失败（未提交）：" + e.getMessage());
+        }
+    }
+
+    /** {@link #handleSet} 的事务体：先算完全部新值并校验，最后一次性 UPDATE。 */
+    private String setFields(String[] argv) throws SQLException {
+        long now = clock.millis();
+
+        // ─── 1) 任务名 = 第一个以 - 开头的词之前的所有内容 ───
+        List<String> titleToks = new ArrayList<>();
+        int i = 0;
+        while (i < argv.length && !argv[i].startsWith("-")) titleToks.add(argv[i++]);
+
+        // ─── 2) 开关 ───
+        Long newTrigger = null;
+        Long newRemind = null;
+        Integer newPriority = null;
+        String newTitle = null;
+        String newNote = null;
+        while (i < argv.length) {
+            String a = argv[i];
+            switch (a) {
+                case "-t": {
+                    if (i + 1 >= argv.length) return "[错误] -t 需要时间\n" + SET_USAGE;
+                    newTrigger = parseTimeToEpochMillis(collectTimeTokens(argv, i));
+                    if (newTrigger == null) return "[提示] set 已放弃（时间无法解析）";
+                    i = consumeTimeTokens(argv, i);
+                    break;
+                }
+                case "-a": {
+                    if (i + 1 >= argv.length) return "[错误] -a 需要时间\n" + SET_USAGE;
+                    newRemind = parseTimeToEpochMillis(collectTimeTokens(argv, i));
+                    if (newRemind == null) return "[提示] set 已放弃（提醒时间无法解析）";
+                    i = consumeTimeTokens(argv, i);
+                    break;
+                }
+                case "-p": {
+                    if (i + 1 >= argv.length) return "[错误] -p 需要数字\n" + SET_USAGE;
+                    try {
+                        newPriority = Integer.parseInt(argv[++i]);
+                    } catch (NumberFormatException e) {
+                        return "[错误] -p 需要整数，得到：" + argv[i];
+                    }
+                    if (newPriority < 1 || newPriority > 9) {
+                        return "[提示] 优先级 priority 应为 1–9，得到：" + newPriority;
+                    }
+                    break;
+                }
+                case "-title": {
+                    // 与 -t 同一套取词规则：吃到下一个开关为止，所以标题里有空格也没问题。
+                    String t = collectTimeTokens(argv, i);
+                    if (t == null) return "[错误] -title 需要新标题\n" + SET_USAGE;
+                    newTitle = t.strip();
+                    if (newTitle.isEmpty()) return "[错误] 新标题不能为空";
+                    i = consumeTimeTokens(argv, i);
+                    break;
+                }
+                case "-n": {
+                    // 与 add 一致：-n 吞掉本行剩余全部内容，所以必须放最后。
+                    if (i + 1 >= argv.length) return "[错误] -n 需要备注内容";
+                    newNote = String.join(" ", java.util.Arrays.copyOfRange(argv, i + 1, argv.length));
+                    i = argv.length - 1;
+                    break;
+                }
+                default:
+                    return "[错误] set 不认识的开关：" + a + "\n" + SET_USAGE;
+            }
+            i++;
+        }
+        if (newTrigger == null && newRemind == null && newPriority == null
+                && newTitle == null && newNote == null) {
+            return "[提示] set 没有任何要改的内容。\n" + SET_USAGE;
+        }
+
+        // ─── 3) 定位目标：不写名字就沿用 done/remove/push 的取法 ───
+        String id;
+        String title;
+        if (titleToks.isEmpty()) {
+            String[] target = resolveBareTarget();
+            if (target == null) return "[提示] 没有可修改的任务（发 next 看看下一步）";
+            id = target[0];
+            title = target[1];
+        } else {
+            String wanted = String.join(" ", titleToks);
+            id = null;
+            title = wanted;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT id, title FROM tasks WHERE title=? AND status NOT IN ('done','removed') "
+                            + "ORDER BY created_at DESC LIMIT 1")) {
+                ps.setString(1, wanted);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        id = rs.getString("id");
+                        title = rs.getString("title");
+                    }
+                }
+            }
+            if (id == null) return "[提示] 未找到未完成任务: \"" + wanted + "\"";
+        }
+
+        // ─── 4) 读当前值 ───
+        int priority;
+        String note;
+        Long triggerAt;
+        Long remindAt;
+        long lastNotified;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT title, note, priority, trigger_at, remind_at, last_notified_at "
+                        + "FROM tasks WHERE id=?")) {
+            ps.setString(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return "[提示] 任务不存在（可能已被删除）：\"" + title + "\"";
+                title = rs.getString("title");
+                note = rs.getString("note");
+                priority = rs.getInt("priority");
+                triggerAt = readNullableLong(rs, "trigger_at");
+                remindAt = readNullableLong(rs, "remind_at");
+                lastNotified = rs.getLong("last_notified_at");
+            }
+        }
+
+        // ─── 5) 改名要防撞名（否则 done/remove 的精确匹配会变得有歧义） ───
+        boolean renaming = newTitle != null && !newTitle.equals(title);
+        if (renaming && hasActiveTask(newTitle)) {
+            return "[提示] 已有同名未完成任务：\"" + newTitle + "\"，没有改名。";
+        }
+
+        // ─── 6) 不制造过去的时间（与 push 同一口径） ───
+        if (newTrigger != null && newTrigger <= now) {
+            return "[提示] 设置后的 DDL 在过去：" + fmtEpoch(newTrigger)
+                    + "（现在 " + fmtEpoch(now) + "），已拒绝。";
+        }
+        if (newRemind != null && newRemind <= now) {
+            return "[提示] 设置后的提醒时间在过去：" + fmtEpoch(newRemind)
+                    + "（现在 " + fmtEpoch(now) + "），已拒绝。";
+        }
+
+        // ─── 7) 时间是不是真的变了（决定要不要重新武装提醒） ───
+        boolean timeChanged = (newTrigger != null && !newTrigger.equals(triggerAt))
+                || (newRemind != null && !newRemind.equals(remindAt));
+
+        // ─── 8) 组装 UPDATE：只动你写出来的字段 ───
+        List<String> sets = new ArrayList<>();
+        List<Object> vals = new ArrayList<>();
+        boolean priorityChanged = newPriority != null && newPriority != priority;
+        boolean noteChanged = newNote != null && !newNote.equals(note);
+        if (renaming) { sets.add("title=?"); vals.add(newTitle); }
+        if (noteChanged) { sets.add("note=?"); vals.add(newNote); }
+        if (priorityChanged) { sets.add("priority=?"); vals.add(newPriority); }
+        if (newTrigger != null) { sets.add("trigger_at=?"); vals.add(newTrigger); }
+        if (newRemind != null) { sets.add("remind_at=?"); vals.add(newRemind); }
+        // 注意：updated_at 每次都会写，所以不能拿 sets.size() 判断「有没有实际改动」。
+        if (!renaming && !noteChanged && !priorityChanged && !timeChanged) {
+            return "[提示] 没有实际改动（值本来就是这些）。";
+        }
+        sets.add("updated_at=?"); vals.add(now);
+        if (timeChanged) sets.add("last_notified_at=NULL");   // 新时间到了要能再响一次
+
+        String beforeJson = rowToJson(id);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE tasks SET " + String.join(", ", sets) + " WHERE id=? AND status='todo'")) {
+            int k = 1;
+            for (Object v : vals) {
+                if (v instanceof Long l) ps.setLong(k++, l);
+                else if (v instanceof Integer n) ps.setInt(k++, n);
+                else ps.setString(k++, String.valueOf(v));
+            }
+            ps.setString(k, id);
+            if (ps.executeUpdate() != 1) throw new SQLException("目标任务已不是 TODO，可能刚被完成或删除");
+        }
+        opLog.recordUpdateStrict(id, "set", beforeJson, rowToJson(id));
+        markShown(id);
+
+        // ─── 9) 回显：只列改过的项，新旧对照 ───
+        StringBuilder sb = new StringBuilder();
+        sb.append("[OK] 已修改：\"").append(renaming ? newTitle : title).append("\"");
+        if (renaming) sb.append("（原名 \"").append(title).append("\"）");
+        if (newTrigger != null) {
+            sb.append("\n     DDL  ").append(triggerAt == null ? "（原本没有）" : fmtEpoch(triggerAt))
+                    .append(" → ").append(fmtEpoch(newTrigger));
+        }
+        if (newRemind != null) {
+            sb.append("\n     提醒 ").append(remindAt == null ? "（原本没有）" : fmtEpoch(remindAt))
+                    .append(" → ").append(fmtEpoch(newRemind));
+        }
+        if (newPriority != null) {
+            sb.append("\n     优先级 ").append(priority).append(" → ").append(newPriority);
+        }
+        if (newNote != null) {
+            sb.append("\n     备注 ").append(note == null ? "（原本没有）" : note)
+                    .append(" → ").append(newNote);
+        }
+        if (timeChanged && lastNotified != 0) {
+            sb.append("\n     提醒已重新武装：新时间到了会再提醒一次");
+        }
+        sb.append("\n     （改错了发 undo 撤销）");
+        return sb.toString();
     }
 
     // ─────────────────────────── export ───────────────────────────
@@ -1053,7 +1506,10 @@ public class TaskEngine {
             + "  next               —— 下一条该做的任务（时间最近 + 优先级可插队）\n"
             + "  done [任务名]      —— 完成任务；留空时目标＝计时中的活动 > 最近出现的任务 > 上次提醒的 > next\n"
             + "  remove [任务名]    —— 移除任务；留空的取法同 done\n"
-            + "  undo               —— 撤销最近一次 add/remove/done（安全网，重启后仍有效）\n"
+            + "  push [任务名] [增量] —— 平移任务时间（+推迟/-提前，如 1h、2d、-30m；省略增量=推迟一天）\n"
+            + "  set [任务名] [开关…] —— 改已有任务的属性：-t DDL / -a 提醒 / -p 优先级 / -title 新标题 / -n 备注\n"
+            + "      例：set 考试 -t month11 day2 -p 2；set 高数当周作业 -title 高数作业 -n 记错了\n"
+            + "  undo               —— 撤销最近一次 add/remove/done/push/set（安全网，重启后仍有效）\n"
             + "  working | w <活动名> —— 开始/切换计时；无参查看当前或继续最近活动\n"
             + "  pause | p          —— 暂停当前活动；计时区间不随 undo 回滚\n"
             + "  stats [today|week|all] [活动名] —— 时长、占比、样本数、中位数与排除项；默认今天\n"

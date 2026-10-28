@@ -91,6 +91,15 @@ public class OpLogKit {
         insertStrict(normalizeOpType(opType), taskId, beforeJson, afterJson);
     }
 
+    /**
+     * push（平移任务时间）：记录操作前后快照，撤销时整行回滚。失败抛异常，不静默。
+     * <p>时间类改动没法用「改 status」表达，所以必须存快照，否则 undo 无从下手。
+     */
+    public void recordUpdateStrict(String taskId, String opType, String beforeJson, String afterJson)
+            throws SQLException {
+        insertStrict(opType, taskId, beforeJson, afterJson);
+    }
+
     /** 把 status 形式（removed）归一化成 op 形式（remove）。 */
     private static String normalizeOpType(String s) {
         if (s == null) return "";
@@ -171,6 +180,24 @@ public class OpLogKit {
                     return new UndoOutcome(false, "[错误] 撤销 add 失败：未找到任务");
                 }
                 return new UndoOutcome(true, "[已撤销] 刚才添加的任务已移除：" + name);
+            }
+            case "push":
+            case "set": {
+                // 只改了任务字段（时间/优先级/标题/备注），整行回滚最省事
+                if (beforeJson == null) {
+                    return new UndoOutcome(false, "[错误] 缺少操作前快照，无法撤销 " + opType);
+                }
+                JsonObject before;
+                try {
+                    before = JsonParser.parseString(beforeJson).getAsJsonObject();
+                } catch (RuntimeException e) {
+                    return new UndoOutcome(false, "[错误] 操作前快照损坏，无法撤销 " + opType);
+                }
+                if (!restoreSnapshot(taskId, before, now)) {
+                    return new UndoOutcome(false, "[错误] 撤销 " + opType + " 失败：未找到任务");
+                }
+                return new UndoOutcome(true, "[已撤销] 已恢复"
+                        + ("push".equals(opType) ? "时间调整前的任务：" : "修改前的任务：") + name);
             }
             case "done":
             case "remove": {

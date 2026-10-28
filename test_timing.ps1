@@ -28,6 +28,18 @@ try {
     $nextExit = $LASTEXITCODE
     Get-Content -Encoding UTF8 $nextResults
     if ($nextExit -ne 0) { throw 'Next / REQ-008 tests failed' }
+    # 2026-10-26 REQ-016（push 平移任务时间）
+    $pushResults = Join-Path $timingResults 'push-results.txt'
+    & java '-Dfile.encoding=UTF-8' -cp $timingCp PushTest $timingResults
+    $pushExit = $LASTEXITCODE
+    Get-Content -Encoding UTF8 $pushResults
+    if ($pushExit -ne 0) { throw 'Push / REQ-016 tests failed' }
+    # 2026-10-28 REQ-017（set 修改已有任务的属性）
+    $setResults = Join-Path $timingResults 'set-results.txt'
+    & java '-Dfile.encoding=UTF-8' -cp $timingCp SetTest $timingResults
+    $setExit = $LASTEXITCODE
+    Get-Content -Encoding UTF8 $setResults
+    if ($setExit -ne 0) { throw 'Set / REQ-017 tests failed' }
     $consoleResults = Join-Path $timingResults 'console-redirected.txt'
     & java '-Dfile.encoding=UTF-8' -cp $timingCp ConsoleInputTest $consoleResults
     if ($LASTEXITCODE -ne 0) { throw 'Console input tests failed' }
