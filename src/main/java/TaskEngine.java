@@ -236,6 +236,9 @@ public class TaskEngine {
         Long remindAt = null;
         boolean hasSharedT = false, hasSharedA = false, hasSharedP = false, hasSharedG = false;
         boolean aiUsed = false;      // 回显时要标明是否为 AI 识别（R5）
+        String recPeriod = null;     // REQ-018：-r 的周期（1d/1w/1mo）
+        Long recUntil = null;        // REQ-018：-until 截止时刻
+        String recurrenceRule = null;
 
         try {
             int i = 0;
@@ -270,6 +273,24 @@ public class TaskEngine {
                         if (remindAt == null) { out.accept("[提示] add 已放弃（时间无法解析）"); return; }
                         i = consumeTimeTokens(argv, i); hasSharedA = true;
                         break;
+                    case "-r":
+                        // REQ-018：-r 1d / 1w / 1mo（隐含 -g recurring）
+                        if (i + 1 >= argv.length) { out.accept("[错误] -r 需要周期：1d / 1w / 1mo"); return; }
+                        recPeriod = argv[++i].toLowerCase();
+                        if (!Recurrence.isValidPeriod(recPeriod)) {
+                            out.accept("[错误] 不支持的循环周期：" + recPeriod
+                                    + "\n        可用：1d（每天）｜1w（每周）｜1mo（每月）");
+                            return;
+                        }
+                        triggerType = "recurring";
+                        break;
+                    case "-until":
+                        // REQ-018：-until 截止时刻（"以后不在这个时间点之后提醒"）
+                        if (i + 1 >= argv.length) { out.accept("[错误] -until 需要截止时刻"); return; }
+                        recUntil = parseTimeToEpochMillis(collectTimeTokens(argv, i));
+                        if (recUntil == null) { out.accept("[提示] add 已放弃（-until 时间无法解析）"); return; }
+                        i = consumeTimeTokens(argv, i);
+                        break;
                     default:
                         // 静默失败家族（REQ-013 §13.3 的关键修复）：以 - 开头却不是已知开关，
                         // 绝不能静默并入标题 —— 那会让用户以为时间/备注生效，实际没有。
@@ -301,6 +322,30 @@ public class TaskEngine {
         }
         if (remindAt != null && triggerAt != null && remindAt > triggerAt) {
             out.accept("[提示] 提醒时刻 -a 不能在触发时刻 -t 之后");
+            return;
+        }
+
+        // ─── REQ-018：循环任务的参数校验（放在调 AI 之前，避免白跑一次请求）───
+        if ("recurring".equals(triggerType) && recPeriod == null) {
+            // 修掉「-g recurring 静默无效」的老坑：以前它只贴了个类型标签，什么都不会发生。
+            out.accept("[错误] 循环任务必须写 -r（例如 -r 1d）"
+                    + "\n        -g recurring 单写不会重复提醒；-r 会自动把类型设为 recurring");
+            return;
+        }
+        if (recPeriod != null) {
+            // -r 与 -g 同时出现时以 -r 为准（类型必须和实际行为一致，否则 list 里的标签会骗人）
+            triggerType = "recurring";
+            if (!hasSharedT) {
+                out.accept("[错误] -r 需要 -t 指定首次触发时刻（-t 的时分秒就是「每天几点」）");
+                return;
+            }
+            if (remindAt != null) {
+                out.accept("[错误] 循环任务不支持 -a：提醒时刻就是触发时刻本身");
+                return;
+            }
+        }
+        if (recUntil != null && recPeriod == null) {
+            out.accept("[错误] -until 只能和 -r 一起用");
             return;
         }
 
@@ -346,11 +391,29 @@ public class TaskEngine {
         remindAt = finalParsed.getRemindAt();
         priority = finalParsed.getPriority();
 
+        // ─── REQ-018：拼循环规则（1mo 用首次触发的「日」作为每月锚点，避免逐月漂移）───
+        if (recPeriod != null) {
+            if (triggerAt == null) {
+                out.accept("[错误] -r 需要 -t 指定首次触发时刻");
+                return;
+            }
+            if (recUntil != null && recUntil <= triggerAt) {
+                out.accept("[提示] -until 不能在首次触发时刻之前");
+                return;
+            }
+            Integer dom = Recurrence.MONTHLY.equals(recPeriod)
+                    ? Integer.valueOf(java.time.Instant.ofEpochMilli(triggerAt)
+                        .atZone(java.time.ZoneId.systemDefault()).getDayOfMonth())
+                    : null;
+            recurrenceRule = Recurrence.buildRule(recPeriod, dom, recUntil);
+        }
+
         // 过去时刻由 ParsedTaskValidator 明确拒绝（“时间已过去：…”），不会静默入库。
-        String newId = addTask(title, note, triggerType, finalPriority, triggerAt, remindAt, estimate);
+        String newId = addTask(title, note, triggerType, finalPriority, triggerAt, remindAt, estimate,
+                recurrenceRule);
         if (newId == null) return; // 插入失败，addTask 已报错
 
-        echoAdd(newId, title, finalPriority, triggerAt, remindAt, estimate, aiUsed);
+        echoAdd(newId, title, finalPriority, triggerAt, remindAt, estimate, aiUsed, recurrenceRule);
         // REQ-008（2026-10-23）：回执只留这一条任务，不再把全表打一遍。
         // 想看全部时打 `list all`；这一行留着只会让「刚加完」的确认信息淹在列表里。
         // 同时把这条任务记成「最近出现的任务」，作为无参 done/remove 的首选目标（REQ-004）。
@@ -365,7 +428,7 @@ public class TaskEngine {
      * @return 新任务 id；失败返回 null（已在内部报错）
      */
     private String addTask(String title, String note, String triggerType, int priority,
-                           Long triggerAt, Long remindAt, Integer estimate) {
+                           Long triggerAt, Long remindAt, Integer estimate, String recurrenceRule) {
         String id = UUID.randomUUID().toString();
         String sql = "INSERT INTO tasks(" +
                 "id,title,note,trigger_type,status,priority," +
@@ -386,7 +449,8 @@ public class TaskEngine {
                     if (triggerAt != null) ps.setLong(7, triggerAt); else ps.setNull(7, Types.INTEGER);
                     if (remindAt != null) ps.setLong(8, remindAt); else ps.setNull(8, Types.INTEGER);
                     if (estimate != null) ps.setLong(9, estimate); else ps.setNull(9, Types.INTEGER);
-                    ps.setNull(10, Types.VARCHAR);
+                    if (recurrenceRule != null) ps.setString(10, recurrenceRule);
+                    else ps.setNull(10, Types.VARCHAR);
                     ps.setNull(11, Types.INTEGER);
                     ps.setNull(12, Types.VARCHAR);
                     ps.setNull(13, Types.INTEGER);
@@ -471,7 +535,7 @@ public class TaskEngine {
 
     /** S3 权威回显（§2.4 R1–R5）：必须写明具体时间、提示 undo、无时间时显式警告、标明是否 AI。 */
     private void echoAdd(String id, String title, int priority, Long triggerAt,
-                         Long remindAt, Integer estimate, boolean aiUsed) {
+                         Long remindAt, Integer estimate, boolean aiUsed, String recurrenceRule) {
         StringBuilder sb = new StringBuilder();
         sb.append("[OK] 已添加：").append(title);
         if (aiUsed) sb.append("  （AI 识别）");
@@ -487,6 +551,13 @@ public class TaskEngine {
             if (priority > 0) sb.append(" ｜ 优先级 ").append(priority);
         }
         sb.append("\n     （").append(aiUsed ? "AI 识别" : "已添加").append("，错了发 undo 撤销）"); // R2
+        if (Recurrence.isRecurring(recurrenceRule)) {   // REQ-018：把循环口径说清楚，别让「重复」靠猜
+            sb.append("\n     [循环] ").append(Recurrence.describe(recurrenceRule))
+              .append(" · 首次 ").append(fmtEpoch(triggerAt))
+              .append(Recurrence.untilOf(recurrenceRule) == null
+                      ? "（之后一直重复，直到 remove 或 done 后次日复活）"
+                      : "（到期后不再重复）");
+        }
         out.accept(sb.toString());
     }
 
@@ -836,12 +907,21 @@ public class TaskEngine {
             long now = clock.millis();
             String beforeJson = rowToJson(id);
             if (com.google.gson.JsonParser.parseString(beforeJson).getAsJsonObject().has("error") || "{}".equals(beforeJson)) throw new SQLException("无法读取操作前快照");
-            String u = "UPDATE tasks SET status=?, done_at=?, updated_at=? WHERE id=? AND status='todo'";
+            // REQ-018：循环任务完成时记下「次日 00:00 复活」；removed 不写（系列即结束）
+            String recRule = null;
+            try (PreparedStatement ps = conn.prepareStatement("SELECT recurrence_rule FROM tasks WHERE id=?")) {
+                ps.setString(1, id);
+                try (ResultSet rs = ps.executeQuery()) { if (rs.next()) recRule = rs.getString(1); }
+            }
+            Long reviveAt = "done".equals(newStatus) ? Recurrence.reviveStampFor(recRule, now) : null;
+            String u = "UPDATE tasks SET status=?, done_at=?, updated_at=?, next_trigger_at=? "
+                    + "WHERE id=? AND status='todo'";
             try (PreparedStatement ps = conn.prepareStatement(u)) {
                 ps.setString(1, newStatus);
                 if ("done".equals(newStatus)) ps.setLong(2, now); else ps.setNull(2, Types.INTEGER);
                 ps.setLong(3, now);
-                ps.setString(4, id);
+                if (reviveAt != null) ps.setLong(4, reviveAt); else ps.setNull(4, Types.INTEGER);
+                ps.setString(5, id);
                 if (ps.executeUpdate() != 1) throw new SQLException("目标任务已不是 TODO；请先 pause 收尾或重新选择");
             }
             // S4：remove / done 记录前后快照，供撤销
@@ -1416,7 +1496,7 @@ public class TaskEngine {
             return;
         }
         String where = all ? "status != 'removed'" : "status = ?";
-        String sql = "SELECT id, title, note, status, priority, trigger_type, " +
+        String sql = "SELECT id, title, note, status, priority, trigger_type, recurrence_rule, " +
                 "CASE WHEN trigger_at IS NULL THEN '' " +
                 "     ELSE datetime(trigger_at/1000, 'unixepoch', 'localtime') END AS due " +
                 "FROM tasks WHERE " + where + " ORDER BY created_at ASC";
@@ -1437,6 +1517,8 @@ public class TaskEngine {
                     sb.append("\n  ").append(n).append(". [").append(st).append("] *").append(priority)
                       .append(" (").append(type).append(")");
                     if (!due.isEmpty()) sb.append(" DDL ").append(due);
+                    String rec = rs.getString("recurrence_rule");
+                    if (Recurrence.isRecurring(rec)) sb.append("  [循环] ").append(Recurrence.describe(rec));
                     sb.append("  ").append(title);
                     if (note != null && !note.isEmpty()) sb.append("  ").append(note);
                     if (active != null && rs.getString("id").equals(active.taskId()))
@@ -1501,6 +1583,8 @@ public class TaskEngine {
         out.accept("用法：\n"
             + "  add <标题> [-p 优先级1-9] [-g once|recurring|ongoing] [-t 触发时刻] [-a 提醒时刻] [-n 备注]\n"
             + "      注意：-n 必须放在最后，其后所有内容都会作为备注；未知开关（如 -x）会直接报错\n"
+            + "      循环：-r 1d|1w|1mo 需配 -t（-t 的时分秒＝每次几点），-until 截止时刻，例：\n"
+            + "        add 每天晚上提醒 -r 1d -t year2026 month11 day1 time21:00\n"
             + "  list | ls          —— 列出待办任务（TODO，默认）\n"
             + "  list done|removed|all  —— 列出 已完成 / 已移除 / 全部（TODO+DONE）\n"
             + "  next               —— 下一条该做的任务（时间最近 + 优先级可插队）\n"

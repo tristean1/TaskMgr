@@ -12,12 +12,11 @@ import java.nio.charset.StandardCharsets;
  */
 public class Main {
 
-    /** 懒创建的 QQ 机器人（qqbot up 时初始化）。 */
-    private static QqBot qqBot;
-    /** qqbot 使用的独立数据库连接（与主循环连接分离，避免线程并发复用）。 */
-    private static Connection qqConn;
-    /** BUG-001：QQ 机器人运行期间持有的跨进程单实例锁，qqbot down 时释放。 */
-    private static SingleInstanceLock qqLock;
+    /**
+     * QQ 机器人托管（第 2 期起与守护进程共用同一份实现 {@link QqBotHost}）。
+     * 懒创建：{@code qqbot up} 时才初始化，避免不用 QQ 的人也付一份连接代价。
+     */
+    private static QqBotHost qqHost;
 
     private static String dbPath() {
         return System.getProperty("user.home")
@@ -47,7 +46,7 @@ public class Main {
             reminder.setLogger(System.out::println);
             reminder.setOnTick(() -> engine.timingTick(message -> {
                 System.out.println(message);
-                if (qqBot != null && qqBot.isUp()) qqBot.pushRemind(message);
+                if (qqHost != null) qqHost.pushRemind(message);
             }));
             reminder.start(0, 10_000L);
 // 每日自动导出 .ics（手机兜底）：启动时先导一次，之后每 6 小时重导（幂等，容错覆盖“每天至少一次”）
@@ -97,10 +96,8 @@ public class Main {
             } finally {
                 reminder.stop();
                 icsTimer.shutdownNow();
-                if (qqBot != null) qqBot.stopMessaging();
+                if (qqHost != null) qqHost.close();
                 engine.shutdownTiming(System.out::println);
-                if (qqConn != null) qqConn.close();
-                if (qqLock != null) qqLock.release();
                 try { Runtime.getRuntime().removeShutdownHook(timingShutdown); }
                 catch (IllegalStateException ignored) { }
             }
@@ -160,100 +157,22 @@ public class Main {
 
     /**
      * 处理 qqbot 命令：up|down|status
-     * 在运行中的主命令行里开关 QQ 消息功能（收发 + 到期提醒的 QQ 推送）。
+     * 实现全部委托给 {@link QqBotHost}——守护进程里的 {@code task qqbot} 走的是同一份代码，
+     * 免得"控制台能开、后台开不了"这种漂移。
      */
     private static void handleQqbot(ReminderService reminder, String[] argv) {
-        if (argv.length == 0) {
-            System.out.println("用法: qqbot up|down|status");
-            return;
+        if (qqHost == null) {
+            qqHost = new QqBotHost(dbPath(), System.out::println);
         }
-        String subcmd = argv[0].toLowerCase();
-        switch (subcmd) {
-            case "up":
-                qqbotUp(reminder);
-                break;
-            case "down":
-                qqbotDown(reminder);
-                break;
-            case "status":
-                System.out.println(qqBot != null && qqBot.isUp()
-                        ? "QQ 消息功能: 已开启"
-                        : "QQ 消息功能: 已关闭");
-                System.out.println("单实例锁(qqbot): " + System.lineSeparator()
-                        + SingleInstanceLock.describeHolder("qqbot"));
-                break;
-            default:
-                System.out.println("未知子命令: " + subcmd + "，可用: up|down|status");
-        }
-    }
-
-    /** qqbot up：懒初始化机器人并开启消息收发，同时挂上提醒推送回调。 */
-    private static void qqbotUp(ReminderService reminder) {
-        // 同一进程内重复 qqbot up：直接提示，避免又去抢锁（同 JVM 抢锁会拿到 null 而误报"别的实例"）。
-        if (qqBot != null && qqBot.isUp()) {
-            System.out.println("[QQBot] 消息功能已在运行（如需重开请先 qqbot down）");
-            return;
-        }
-        // BUG-001：跨进程单实例保护。本进程内的 qqBot != null 只能防"同一进程连点两次"，
-        // 防不住"另一个 JVM 也在跑 QqBot"——那才是实测中导致连接互踢的元凶。
-        SingleInstanceLock lock = null;
-        try {
-            lock = SingleInstanceLock.acquire("qqbot", "Main(qqbot up)");
-        } catch (Exception e) {
-            System.out.println("[QQBot] 单实例锁创建失败: " + e.getMessage());
-            return;
-        }
-        if (lock == null) {
-            System.out.println("[QQBot] 已有另一个 QqBot 实例在运行，本次开启已取消。");
-            System.out.println("        当前锁持有者：");
-            System.out.println("        " + SingleInstanceLock.describeHolder("qqbot")
-                    .replace(System.lineSeparator(), System.lineSeparator() + "        "));
-            System.out.println("        若确认没有实例在跑，可删除 ~/.taskmgr/qqbot.lock 后重试。");
-            return;
-        }
-
-        if (qqBot == null) {
-            try {
-                Class.forName("org.sqlite.JDBC");
-                qqConn = DriverManager.getConnection("jdbc:sqlite:" + dbPath());
-                qqConn.setAutoCommit(true);
-                qqBot = new QqBot(new TaskEngine(qqConn));
-                qqBot.loadConfig();
-            } catch (Exception e) {
-                System.out.println("[QQBot] 初始化失败: " + e.getMessage());
-                lock.release();
-                return;
-            }
-        }
-        if (qqBot.isUp()) {
-            System.out.println("[QQBot] 消息功能已在运行");
-            lock.release();   // 已在运行 → 归还锁，避免自己占着不放
-            return;
-        }
-        try {
-            qqBot.startMessaging();
-            reminder.setOnTaskRemind(qqBot::pushRemind);
-            // 锁交由本进程持有，直到 qqbotDown 释放
-            qqLock = lock;
-            System.out.println("[QQBot] 已开启，并已接入到期提醒的 QQ 推送");
-        } catch (Exception e) {
-            System.out.println("[QQBot] 启动失败: " + e.getMessage());
-            lock.release();
-        }
-    }
-
-    /** qqbot down：关闭 QQ 消息收发，并解除提醒推送回调。 */
-    private static void qqbotDown(ReminderService reminder) {
-        reminder.setOnTaskRemind(null);
-        if (qqBot != null) {
-            qqBot.stopMessaging();
+        StringBuilder cmd = new StringBuilder("qqbot");
+        for (String a : argv) cmd.append(' ').append(a);
+        System.out.println(qqHost.execute(cmd.toString()));
+        // 提醒要不要往 QQ 推，跟着 QQ 的开关走：开起来就挂回调，关下去就摘掉。
+        // （三元里放方法引用推断不出目标类型，只能拆成两句。）
+        if (qqHost.isUp()) {
+            reminder.setOnTaskRemind(qqHost::pushRemind);
         } else {
-            System.out.println("[QQBot] 消息收发本就处于关闭状态");
-        }
-        // BUG-001：关闭时归还单实例锁，让其他启动方式能接管
-        if (qqLock != null) {
-            qqLock.release();
-            qqLock = null;
+            reminder.setOnTaskRemind(null);
         }
     }
 }

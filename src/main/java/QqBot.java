@@ -674,10 +674,15 @@ public class QqBot {
         // 使用 ReminderService 相同的SQL逻辑
         // BUG-007（2026-10-19 修复）：必须排除 done，否则已完成的任务到 DDL 仍会被推送。
         // 注意：本处与 ReminderService 是两个独立扫描器，必须同时改，否则两套运行方式行为不一致。
-        String sql = "SELECT id,title,note,remind_at,last_notified_at FROM tasks WHERE status NOT IN ('done','removed') AND ( (remind_at IS NOT NULL AND remind_at<=?) OR (trigger_at IS NOT NULL AND trigger_at<=?) )";
+        String sql = "SELECT id,title,note,remind_at,trigger_at,recurrence_rule,last_notified_at FROM tasks WHERE status NOT IN ('done','removed') AND ( (remind_at IS NOT NULL AND remind_at<=?) OR (trigger_at IS NOT NULL AND trigger_at<=?) )";
         long now = System.currentTimeMillis();
         Set<String> seen = new HashSet<>();
         try (Connection c = conn(); PreparedStatement ps = c.prepareStatement(sql)) {
+            // REQ-018：循环任务的两步前置推进（与 ReminderService 同口径，各自 try/catch）
+            try { Recurrence.reviveDue(c, now); }
+            catch (Exception e) { log("[循环] 复活失败: " + e.getMessage()); }
+            try { Recurrence.rearmDue(c, now); }
+            catch (Exception e) { log("[循环] 重新武装失败: " + e.getMessage()); }
             ps.setLong(1, now);
             ps.setLong(2, now);
             try (ResultSet rs = ps.executeQuery()) {
@@ -699,14 +704,17 @@ public class QqBot {
                     String title = rs.getString("title");
                     String note = rs.getString("note");
                     long remindAt = rs.getLong("remind_at");
-                    String line = buildRemindText(title, note, remindAt);
+                    long triggerAt = rs.getLong("trigger_at");
+                    // REQ-018：循环任务没有 remind_at，展示触发时刻而不是「到点」
+                    String line = buildRemindText(title, note, remindAt > 0 ? remindAt : triggerAt);
                     // 本地弹窗：每个任务只弹一次（重试推送时不再重复打扰）
                     if (pacing.markAlerted(id)) localAlert(line);
 
                     // BUG-027（附六 §6.5）：推送成功才写 last_notified_at；
                     // 失败则保留未提醒状态，下一轮重试（而不是把提醒永久烧掉）。
                     boolean delivered = !messagingUp || pushToQQ(line);
-                    if (delivered && markNotified(c, id, now)) {
+                    if (delivered && markNotified(c, id, now, rs.getString("recurrence_rule"),
+                            triggerAt > 0 ? Long.valueOf(triggerAt) : null)) {
                         pacing.onSuccess(id);
                         log("[提醒] 已触发: " + title);
                     } else {
@@ -793,13 +801,14 @@ public class QqBot {
         return pushToQQ(text);
     }
 
-    /** 更新 last_notified_at，防止重复提醒。@return 是否真的写入（行数=1） */
-    private boolean markNotified(Connection c, String id, long now) {
-        try (PreparedStatement ps = c.prepareStatement(
-                "UPDATE tasks SET last_notified_at=? WHERE id=? AND last_notified_at IS NULL")) {
-            ps.setLong(1, now);
-            ps.setString(2, id);
-            return ps.executeUpdate() == 1;
+    /**
+     * 更新 last_notified_at，防止重复提醒。@return 是否真的写入（行数=1）
+     * <p>REQ-018：循环任务顺带把 trigger_at 推到下一次；与 {@link ReminderService} 共用
+     * {@link Recurrence#markNotified}，两个扫描器口径不会分叉。
+     */
+    private boolean markNotified(Connection c, String id, long now, String rule, Long triggerAt) {
+        try {
+            return Recurrence.markNotified(c, id, now, rule, triggerAt);
         } catch (Exception e) {
             log("[提醒] 记录通知失败: " + e.getMessage());
             return false;

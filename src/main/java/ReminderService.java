@@ -87,12 +87,19 @@ public class ReminderService {
     }
 
     private void checkReminders() {
+        long now = System.currentTimeMillis();
+        // REQ-018：循环任务的两步前置推进（复活 + 重新武装）。
+        // 各自独立 try/catch —— 循环逻辑出任何问题都绝不能连累提醒本身（BUG-007 的教训）。
+        try { Recurrence.reviveDue(conn, now); }
+        catch (Exception e) { logger.accept("[循环] 复活失败: " + e.getMessage()); }
+        try { Recurrence.rearmDue(conn, now); }
+        catch (Exception e) { logger.accept("[循环] 重新武装失败: " + e.getMessage()); }
+
         // BUG-007（2026-10-19 修复）：必须排除 done。
         // 用 NOT IN 而不是 ='todo'，是为了将来 ongoing 类型加进来时不必再改这一行。
-        String sql = "SELECT id,title,note,remind_at,last_notified_at FROM tasks "
+        String sql = "SELECT id,title,note,remind_at,trigger_at,recurrence_rule,last_notified_at FROM tasks "
                 + "WHERE status NOT IN ('done','removed') "
                 + "AND ( (remind_at IS NOT NULL AND remind_at<=?) OR (trigger_at IS NOT NULL AND trigger_at<=?) )";
-        long now = System.currentTimeMillis();
         Set<String> seen = new HashSet<>();
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setLong(1, now);
@@ -110,7 +117,9 @@ public class ReminderService {
                     String title = rs.getString("title");
                     String note = rs.getString("note");
                     long remindAt = rs.getLong("remind_at");
-                    String line = buildRemindText(title, note, remindAt);
+                    long triggerAt = rs.getLong("trigger_at");
+                    // REQ-018：循环任务没有 remind_at，展示触发时刻而不是「到点」
+                    String line = buildRemindText(title, note, remindAt > 0 ? remindAt : triggerAt);
                     // 本地弹窗：每个任务只弹一次（重试推送时不再重复打扰）
                     if (pacing.markAlerted(id)) alerter.accept(line);
 
@@ -129,7 +138,8 @@ public class ReminderService {
                         }
                     }
 
-                    if (delivered && markNotified(id, now)) {
+                    if (delivered && markNotified(id, now, rs.getString("recurrence_rule"),
+                            triggerAt > 0 ? Long.valueOf(triggerAt) : null)) {
                         pacing.onSuccess(id);
                     } else {
                         pacing.onFailure(id, now);
@@ -172,13 +182,14 @@ public class ReminderService {
         } catch (Throwable ignore) {}
     }
 
-    /** 更新 last_notified_at；返回是否真的写入（行数=1，幂等）。 */
-    private boolean markNotified(String id, long now) {
-        try (PreparedStatement ps = conn.prepareStatement(
-                "UPDATE tasks SET last_notified_at=? WHERE id=? AND last_notified_at IS NULL")) {
-            ps.setLong(1, now);
-            ps.setString(2, id);
-            return ps.executeUpdate() == 1;
+    /**
+     * 更新 last_notified_at；返回是否真的写入（行数=1，幂等）。
+     * <p>REQ-018：循环任务顺带把 trigger_at 推到下一次（由 {@link Recurrence#markNotified} 统一处理，
+     * 另一个扫描器也走同一个方法，避免两边口径分叉）。
+     */
+    private boolean markNotified(String id, long now, String rule, Long triggerAt) {
+        try {
+            return Recurrence.markNotified(conn, id, now, rule, triggerAt);
         } catch (Exception e) {
             logger.accept("[提醒] 记录通知失败: " + e.getMessage());
             return false;
