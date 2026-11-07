@@ -1,0 +1,29 @@
+[Unit]
+Description=TaskMgr daemon (tasks + reminders + QQ bot host)
+Documentation=https://github.com/tristean1/TaskMgr
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/taskmgr
+
+# 服务器上没有桌面：
+#   1) -Djava.awt.headless=true 让 JVM 一开始就按无头跑，Swing 一次都不碰
+#      （LocalAlert 也会据此把本地弹窗通道换成空实现）；
+#   2) 提醒只走 QQ，靠 settings.properties 不必再写一遍。
+Environment=JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF-8
+
+# 用 bash -lc 起，是为了让 shell 去展开 lib/* —— systemd 自己不做通配符展开。
+ExecStart=/bin/bash -lc 'exec java -Dfile.encoding=UTF-8 -Djava.awt.headless=true -cp "classes:lib/*" Daemon'
+Restart=always
+RestartSec=3
+
+# 日志走 journald：/opt/taskmgr 里不再重复写一份 daemon.log 也行，但项目自己仍会写
+# ~/.taskmgr/logs/daemon.log，两边都能看。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=taskmgr
+
+[Install]
+WantedBy=multi-user.target

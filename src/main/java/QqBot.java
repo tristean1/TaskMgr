@@ -5,8 +5,6 @@ import com.google.gson.JsonParser;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
-import javax.swing.JOptionPane;
-import java.awt.Toolkit;
 import java.io.*;
 import java.net.*;
 import java.net.http.HttpClient;
@@ -745,15 +743,9 @@ public class QqBot {
         return line;
     }
 
-    /** 本地弹窗（EDT）+ 出声（beep）。 */
+    /** 本地弹窗（EDT）+ 出声（beep）；无头环境或设置里关掉时是空操作。 */
     private void localAlert(String text) {
-        try {
-            javax.swing.SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(
-                    null, text, "任务提醒", JOptionPane.INFORMATION_MESSAGE));
-        } catch (Throwable t) {
-            log("[提醒] 弹窗失败: " + t.getMessage());
-        }
-        try { Toolkit.getDefaultToolkit().beep(); } catch (Throwable ignore) {}
+        LocalAlert.show(text);
     }
 
     /**

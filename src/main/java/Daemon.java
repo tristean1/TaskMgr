@@ -56,9 +56,21 @@ public class Daemon {
     /** System.out/err 是否已接管到 daemon.log（见 {@link #installTee()}）。 */
     private static volatile boolean teeInstalled = false;
 
+    /**
+     * 标准输出**已经**指向 daemon.log（{@code TaskClient} 拉起时用 {@code Redirect.appendTo} 重定向）。
+     *
+     * <p><b>为什么需要这个开关</b>：重定向之后如果再 installTee，tee 的两个出口会同时是
+     * daemon.log —— 每行日志写两遍（2026-11-06 在服务器上实测到整份日志重复）。
+     * 所以这种情况不装 tee，{@code log()} 只 println，交给重定向落到文件。
+     */
+    private static volatile boolean stdoutIsLog = false;
+
     private final Gson gson = new Gson();
     private final List<Conn> conns = new CopyOnWriteArrayList<>();
     private final AtomicBoolean stopped = new AtomicBoolean(false);
+    /** 关闭流程真正走完的信号（见 {@code run()} 末尾的等待）。 */
+    private final java.util.concurrent.CountDownLatch shutdownDone =
+            new java.util.concurrent.CountDownLatch(1);
     private final long startedAt = System.currentTimeMillis();
 
     private volatile boolean running = true;
@@ -84,8 +96,9 @@ public class Daemon {
      */
     private static void log(String msg) {
         String line = java.time.LocalDateTime.now().withNano(0) + " [daemon] " + msg;
-        if (teeInstalled) {
-            // 已接管 System.out：只走这一条通道，避免"两个写者交错"。
+        if (teeInstalled || stdoutIsLog) {
+            // System.out 已经通向 daemon.log（tee 或启动方的重定向）：只走这一条通道，
+            // 避免"两个写者交错"，也避免同一行被写两遍。
             System.out.println(line);
             return;
         }
@@ -104,8 +117,8 @@ public class Daemon {
 
     /** 既写日志又写标准输出（前台直接跑时能在控制台看到）。 */
     private static void say(String msg) {
-        if (teeInstalled) {
-            System.out.println(msg);
+        if (teeInstalled || stdoutIsLog) {
+            log(msg);       // log() 内部已改成"只 println"，文件由 tee / 重定向负责
             return;
         }
         log(msg);
@@ -122,6 +135,7 @@ public class Daemon {
      */
     private static synchronized void installTee() {
         if (teeInstalled) return;
+        if (stdoutIsLog) return;    // 启动方已经把 stdout 重定向到 daemon.log，再 tee 就重复了
         try {
             java.nio.file.Files.createDirectories(DaemonEndpoint.logDir());
             java.io.PrintStream real = System.out;
@@ -170,6 +184,11 @@ public class Daemon {
     int run() throws Exception {
         java.nio.file.Files.createDirectories(DaemonEndpoint.home());
         java.nio.file.Files.createDirectories(DaemonEndpoint.logDir());
+        // 启动方（TaskClient）用 appendTo(daemon.log) 重定向了 stdout 时会带这个属性：
+        // 此时不能再装 tee，否则每行写两遍。手工前台运行（java Daemon）没有它，仍装 tee。
+        // ⚠️ 不能用 Boolean.getBoolean()：它只认 "true"，不认 "1"（踩过一次，日志照样重复）。
+        String stdoutFlag = System.getProperty("taskmgr.daemon.stdoutIsLog", "");
+        stdoutIsLog = stdoutFlag.equals("1") || Boolean.parseBoolean(stdoutFlag);
         // 先接管 stdout/err：后面任何一行（包括 QQ 库里的 println）都要能落盘。
         installTee();
 
@@ -203,6 +222,11 @@ public class Daemon {
         reminder = new ReminderService(conn);
         reminder.setLogger(this::event);
         reminder.setOnTick(() -> engine.timingTick(this::event));
+        // 本地弹窗通道：无头环境（云服务器）或 settings.properties 里 local.popup=0 时为空实现
+        reminder.setAlerter(LocalAlert.alerter());
+        event("[daemon] 本地弹窗：" + (LocalAlert.enabled()
+                ? "开启" : "关闭（无桌面环境，或 " + AppSettings.FILE_NAME + " 中的 "
+                        + LocalAlert.KEY_POPUP + "=0）"));
         reminder.start(0, REMIND_INTERVAL_MS);
 
         // 第 2 期：QQ 机器人懒托管。这里只建壳，真正连网要等 task qqbot up。
@@ -233,6 +257,14 @@ public class Daemon {
 
         acceptLoop();
         shutdown();
+        // 停止请求也可能来自另一条线程（__shutdown）：等它真的收尾完再返回。
+        // 否则主线程紧接着的 System.exit 会把正在关闭的线程掐断——数据库不落盘、
+        // socket/锁文件残留（2026-11-06 实测：tasks.db-wal 218KB + daemon.sock 都还在）。
+        try {
+            shutdownDone.await(10, TimeUnit.SECONDS);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
         return 0;
     }
 
@@ -310,11 +342,19 @@ public class Daemon {
     private void shutdown() {
         if (!stopped.compareAndSet(false, true)) return;
         running = false;
+        // 每一步单独兜异常：以前 `for (Conn c : conns) c.close()` 一旦抛，
+        // 后面的 conn.close()/cleanupFiles()/lock.release() 全被跳过 —— 数据库没落盘、
+        // socket 和锁文件留在那儿（2026-11-06 在服务器上实测到）。
         try {
             if (server != null) server.close();
-        } catch (IOException ignored) {
+        } catch (Throwable ignored) {
         }
-        for (Conn c : conns) c.close();
+        for (Conn c : conns) {
+            try {
+                c.close();
+            } catch (Throwable ignored) {
+            }
+        }
         try {
             if (reminder != null) reminder.stop();
         } catch (Throwable ignored) {
@@ -329,12 +369,19 @@ public class Daemon {
         } catch (Throwable ignored) {
         }
         try {
-            if (conn != null) conn.close();
+            if (conn != null) conn.close();   // 最后一条连接关闭 → WAL 落进 tasks.db
         } catch (Throwable ignored) {
         }
-        DaemonEndpoint.cleanupFiles();
-        if (lock != null) lock.release();
-        say("[守护进程] 已停止 " + java.time.LocalDateTime.now());
+        try {
+            DaemonEndpoint.cleanupFiles();
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (lock != null) lock.release();
+        } catch (Throwable ignored) {
+        }
+        say("[守护进程] 已停止 " + java.time.LocalDateTime.now().withNano(0).toLocalTime());
+        shutdownDone.countDown();
     }
 
     /** 一条客户端连接：一行一个 JSON 请求，一行一个 JSON 回复。 */

@@ -79,6 +79,12 @@ public class TaskClient {
             case "up" -> up();
             case "down" -> down();
             case "status" -> status();
+            case "sync" -> {
+                int rc = SyncCommand.run(cmdLine.split("\\s+"));
+                if (rc != 0) System.exit(rc);
+            }
+            case "__snapshot" -> internalSnapshot(cmdLine);
+            case "__install" -> internalInstall(cmdLine);
             case "help", "?", "--help" -> usage();
             case "exit", "quit" ->
                     System.out.println("（当前不在客户端内；exit 只在用 task 进入交互后生效）");
@@ -106,18 +112,24 @@ public class TaskClient {
         System.exit(1);
     }
 
-    private static void spawnDaemon() throws IOException {
+    /** 供 {@link SyncCommand} 复用的启动逻辑（同名包内可见即可）。 */
+    static void spawnDaemon() throws IOException {
         String javaHome = System.getProperty("java.home");
+        boolean windows = System.getProperty("os.name", "").toLowerCase().contains("win");
+        // javaw 是 Windows 的 GUI 子系统程序：不附着任何控制台，因此关掉命令行窗口也不会被带走。
+        // Linux/服务器上没有 javaw（也不存在 .exe），必须退回 bin/java，否则 up 直接找不到可执行文件。
         File javaw = new File(javaHome, "bin" + File.separator + "javaw.exe");
-        File java = new File(javaHome, "bin" + File.separator + "java.exe");
-        // javaw 是 GUI 子系统程序：不附着任何控制台，因此关掉命令行窗口也不会被带走。
-        String exe = javaw.isFile() ? javaw.getAbsolutePath() : java.getAbsolutePath();
+        File java = new File(javaHome, "bin" + File.separator + (windows ? "java.exe" : "java"));
+        String exe = (windows && javaw.isFile()) ? javaw.getAbsolutePath() : java.getAbsolutePath();
 
         Files.createDirectories(DaemonEndpoint.logDir());
         ProcessBuilder pb = new ProcessBuilder(
                 exe,
                 "-Dfile.encoding=UTF-8",
                 "-Dtaskmgr.home=" + DaemonEndpoint.home(),
+                // 告诉 Daemon："stdout 已经是 daemon.log 了，别再装 tee"，
+                // 否则每行日志被写两遍（重定向一次 + tee 一次）。
+                "-Dtaskmgr.daemon.stdoutIsLog=1",
                 "-cp", System.getProperty("java.class.path"),
                 "Daemon");
         pb.redirectErrorStream(true);
@@ -143,6 +155,47 @@ public class TaskClient {
             Thread.sleep(100);
         }
         System.out.println("[提示] 已发出停止请求，但进程仍在收尾。可用 task status 复查。");
+    }
+
+    // ------------------------------------------------------------ 内部子命令
+
+    /**
+     * {@code task __snapshot <文件>}：给同步用的一致快照（{@code VACUUM INTO}）。
+     * <p>内部命令，不出现在帮助里；只由 {@link SyncCommand} 在远端调用。
+     */
+    private static void internalSnapshot(String cmdLine) {
+        try {
+            String[] parts = cmdLine.split("\\s+", 2);
+            if (parts.length < 2 || parts[1].isBlank()) {
+                System.out.println("[错误] 用法：__snapshot <输出文件>");
+                System.exit(2);
+            }
+            java.nio.file.Path out = java.nio.file.Path.of(parts[1].trim());
+            SyncCommand.snapshotLocal(out);
+            System.out.println("SNAPSHOT_OK " + out);
+        } catch (Exception e) {
+            System.out.println("[错误] 快照失败：" + e.getMessage());
+            System.exit(1);
+        }
+    }
+
+    /**
+     * {@code task __install <快照文件>}：备份旧库 → 换文件 → 校验。
+     * <p>只在守护进程已停止时可用；同样属内部命令。
+     */
+    private static void internalInstall(String cmdLine) {
+        try {
+            String[] parts = cmdLine.split("\\s+", 2);
+            if (parts.length < 2 || parts[1].isBlank()) {
+                System.out.println("[错误] 用法：__install <快照文件>");
+                System.exit(2);
+            }
+            SyncCommand.installLocal(java.nio.file.Path.of(parts[1].trim()));
+            System.out.println("INSTALL_OK");
+        } catch (Exception e) {
+            System.out.println("[错误] 安装失败：" + e.getMessage());
+            System.exit(1);
+        }
     }
 
     private static void status() {
@@ -384,6 +437,9 @@ public class TaskClient {
                   task qqbot up        在后台进程里开启 QQ 机器人（关窗口不掉）
                   task qqbot down      关闭 QQ 机器人
                   task qqbot status    查看 QQ 机器人状态
+                  task sync <源>-><目标> [--dry]
+                                       整库搬运（v1 为方向覆盖；--dry 只比对不改动）
+                                       节点名写在 ~/.taskmgr/nodes.properties
                 """);
     }
 

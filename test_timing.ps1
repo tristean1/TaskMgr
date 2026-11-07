@@ -59,6 +59,13 @@ try {
     & java '-Dfile.encoding=UTF-8' -cp $timingCp ConsoleInputTest $consoleResults
     if ($LASTEXITCODE -ne 0) { throw 'Console input tests failed' }
     Get-Content -Encoding UTF8 $consoleResults
+    # 2026-11-06 REQ-020（task sync：快照 / 安装 / 拒绝条件）
+    # 注意：SyncTest 自己用 -Dtaskmgr.home 指到临时目录，不碰真库。
+    $syncResults = Join-Path $timingResults 'sync-results.txt'
+    & java '-Dfile.encoding=UTF-8' -cp $timingCp SyncTest $timingResults
+    $syncExit = $LASTEXITCODE
+    Get-Content -Encoding UTF8 $syncResults
+    if ($syncExit -ne 0) { throw 'Sync / REQ-020 tests failed' }
 } finally {
     Pop-Location
 }

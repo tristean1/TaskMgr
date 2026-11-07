@@ -1,5 +1,3 @@
-import javax.swing.JOptionPane;
-import java.awt.Toolkit;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -24,8 +22,8 @@ public class ReminderService {
     private ScheduledExecutorService timer;
     /** 到点提醒后的推送回调：返回 true 表示推送成功（才允许标记已提醒）。可为 null（=无需推送）。 */
     private volatile Function<String, Boolean> onTaskRemindPush;
-    /** 本地提醒通道；测试/无头环境可注入无声实现。 */
-    private volatile Consumer<String> alerter = this::localAlert;
+    /** 本地提醒通道；测试/无头环境可注入无声实现。默认走 {@link LocalAlert}（受设置开关与无头判定约束）。 */
+    private volatile Consumer<String> alerter = LocalAlert.alerter();
     /** 日志回调；默认静默（保持原有「不影响主流程」的习惯），由调用方决定是否接入。 */
     private volatile Consumer<String> logger = s -> {};
     /** 重试/弹窗节流（BUG-027）。 */
@@ -41,9 +39,9 @@ public class ReminderService {
         this.onTaskRemindPush = cb;
     }
 
-    /** 注入本地提醒实现（默认 Swing 弹窗 + beep；测试可传 no-op）。 */
+    /** 注入本地提醒实现（默认 Swing 弹窗 + beep；传 null 恢复默认）。 */
     public void setAlerter(Consumer<String> alerter) {
-        this.alerter = (alerter == null) ? this::localAlert : alerter;
+        this.alerter = (alerter == null) ? LocalAlert.alerter() : alerter;
     }
 
     /** 注入日志回调（可选）。 */
@@ -165,21 +163,7 @@ public class ReminderService {
     }
 
     private void localAlert(String text) {
-        // 弹窗在 EDT，整段 try/catch(Throwable) 兜底
-        try {
-            javax.swing.SwingUtilities.invokeLater(() -> {
-                try {
-                    JOptionPane.showMessageDialog(null, text, "任务提醒", JOptionPane.INFORMATION_MESSAGE);
-                } catch (Throwable t) {
-                    // 忽略弹窗失败
-                }
-            });
-        } catch (Throwable t) {
-            // 忽略 SwingUtilities 失败
-        }
-        try {
-            Toolkit.getDefaultToolkit().beep();
-        } catch (Throwable ignore) {}
+        LocalAlert.show(text);
     }
 
     /**

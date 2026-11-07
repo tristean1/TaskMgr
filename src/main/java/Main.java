@@ -48,6 +48,8 @@ public class Main {
                 System.out.println(message);
                 if (qqHost != null) qqHost.pushRemind(message);
             }));
+            // 本地弹窗通道：无头环境或 settings.properties 里 local.popup=0 时为空实现
+            reminder.setAlerter(LocalAlert.alerter());
             reminder.start(0, 10_000L);
 // 每日自动导出 .ics（手机兜底）：启动时先导一次，之后每 6 小时重导（幂等，容错覆盖“每天至少一次”）
             java.util.concurrent.ScheduledExecutorService icsTimer =

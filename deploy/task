@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# task —— Linux 上的客户端启动器（对应 Windows 的 task.cmd）。
+#
+# 与 task.cmd 的关键差别：**这里不设 TASKCMDLINE**。
+# task.cmd 之所以要绕道环境变量，是因为 Windows 命令行把中文 argv 按 ANSI 代码页转字节，
+# JVM 再按别的代码页解回来就乱码了。Linux 的 argv 本来就是 UTF-8 字节，直接传没问题。
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CP=$(printf '%s:' "$DIR"/lib/*.jar)
+CP=${CP%:}
+
+# 允许用 TASKMGR_HOME 指向别处的数据目录（测试沙箱、或同时跑两套实例）。
+# 不设则用默认的 ~/.taskmgr。
+OPTS=(-Dfile.encoding=UTF-8)
+if [ -n "${TASKMGR_HOME:-}" ]; then
+  OPTS+=("-Dtaskmgr.home=$TASKMGR_HOME")
+fi
+
+exec java "${OPTS[@]}" -cp "$DIR/classes:$CP" TaskClient "$@"

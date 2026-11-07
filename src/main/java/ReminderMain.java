@@ -28,6 +28,7 @@ public class ReminderMain {
                 ReminderService reminder = new ReminderService(conn);
                 reminder.setLogger(System.err::println);
                 reminder.setOnTick(() -> engine.timingTick(System.out::println));
+                reminder.setAlerter(LocalAlert.alerter());
                 reminder.start(5000, 10_000L);
                 
                 System.out.println("提醒守护进程已启动，监听数据库: " + dbPath);
