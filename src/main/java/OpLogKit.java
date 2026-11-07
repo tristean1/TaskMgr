@@ -62,7 +62,7 @@ public class OpLogKit {
             "title", "note", "trigger_type", "status", "priority",
             "trigger_at", "remind_at", "estimate_minutes",
             "recurrence_rule", "next_trigger_at", "parent_id",
-            "last_notified_at", "done_at"
+            "last_notified_at", "done_at", "hidden"
     };
 
     private final Connection conn;

@@ -1,8 +1,10 @@
 import java.sql.*;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
+import java.time.format.TextStyle;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.function.Consumer;
 
@@ -29,6 +31,8 @@ public class TaskEngine {
     /** 「下一条该做哪件」的排序策略（REQ-004）。规则可整体替换，调用方不感知。 */
     private final NextSelector nextSelector = new NextSelector();
     private final Clock clock;
+    /** REQ-021：每日问候的发送通道（QQ 起来后由宿主注入，null = 现在发不出去）。 */
+    private volatile java.util.function.Function<String, Boolean> greetPusher;
     private String commandSource = "cli";
     /**
      * 计时统计的质量策略（**2026-10-12 修正，BUG-024**）。
@@ -60,6 +64,9 @@ public class TaskEngine {
             " , created_at       INTEGER NOT NULL\n" +
             " , updated_at       INTEGER NOT NULL\n" +
             " , done_at          INTEGER\n" +
+            // REQ-022：隐藏任务（课表这类循环任务）。默认 0 = 正常显示。
+            // 语义：平时不进 list/next，只有「它自己触发的那一天」才浮现（list -a 永远能看到）。
+            " , hidden           INTEGER NOT NULL DEFAULT 0\n" +
             ");";
 
     private static final String DDL_TASK_NOTE =
@@ -114,6 +121,16 @@ public class TaskEngine {
     /** 返回当前输出回调。 */
     public Consumer<String> getOutput() {
         return this.out;
+    }
+
+    /**
+     * 注入「发一条消息出去」的通道（REQ-021 的 {@code greet test} 用）。
+     *
+     * <p>由守护进程/控制台在 QQ 起来后注入；为 {@code null} 表示当前没有发送能力。
+     * 返回 {@code true} 表示对方确实收到了。
+     */
+    public void setGreetPusher(java.util.function.Function<String, Boolean> pusher) {
+        this.greetPusher = pusher;
     }
 
     /** 直接执行一行命令（首个词为命令，其余为参数）。返回处理是否完成（false 表示未知命令）。 */
@@ -205,6 +222,7 @@ public class TaskEngine {
             case "remove":    handleSetStatus(argv, "removed"); break;
             case "push":      handlePush(argv);  break;
             case "set":       handleSet(argv);   break;
+            case "greet":     handleGreet(argv); break;
             case "undo":      handleUndo();  break;
             case "export":    handleExport(argv);      break;
             case "nl":        handleNl(argv);    break;
@@ -239,6 +257,7 @@ public class TaskEngine {
         String recPeriod = null;     // REQ-018：-r 的周期（1d/1w/1mo）
         Long recUntil = null;        // REQ-018：-until 截止时刻
         String recurrenceRule = null;
+        boolean hidden = false;      // REQ-022：-hidden（课表这类，平时不占列表）
 
         try {
             int i = 0;
@@ -291,12 +310,20 @@ public class TaskEngine {
                         if (recUntil == null) { out.accept("[提示] add 已放弃（-until 时间无法解析）"); return; }
                         i = consumeTimeTokens(argv, i);
                         break;
+                    case "-hidden":
+                        // REQ-022：隐藏任务。不带值 = 隐藏；-hidden 0 可以让脚本显式写「不隐藏」。
+                        hidden = true;
+                        if (i + 1 < argv.length && ("0".equals(argv[i + 1]) || "1".equals(argv[i + 1]))) {
+                            hidden = "1".equals(argv[++i]);
+                        }
+                        break;
                     default:
                         // 静默失败家族（REQ-013 §13.3 的关键修复）：以 - 开头却不是已知开关，
                         // 绝不能静默并入标题 —— 那会让用户以为时间/备注生效，实际没有。
                         if (a.startsWith("-")) {
                             out.accept("[错误] 未知开关：" + a
-                                    + "\n        已知开关：-p 优先级｜-g 类型｜-t 触发时刻｜-a 提醒时刻｜-n 备注（必须放最后）");
+                                    + "\n        已知开关：-p 优先级｜-g 类型｜-t 触发时刻｜-a 提醒时刻"
+                                    + "｜-r 循环周期｜-until 截止｜-hidden 隐藏｜-n 备注（必须放最后）");
                             return;
                         }
                         if (title == null) title = a; else title = title + " " + a;
@@ -410,10 +437,11 @@ public class TaskEngine {
 
         // 过去时刻由 ParsedTaskValidator 明确拒绝（“时间已过去：…”），不会静默入库。
         String newId = addTask(title, note, triggerType, finalPriority, triggerAt, remindAt, estimate,
-                recurrenceRule);
+                recurrenceRule, hidden);
         if (newId == null) return; // 插入失败，addTask 已报错
 
-        echoAdd(newId, title, finalPriority, triggerAt, remindAt, estimate, aiUsed, recurrenceRule);
+        echoAdd(newId, title, finalPriority, triggerAt, remindAt, estimate, aiUsed, recurrenceRule,
+                hidden);
         // REQ-008（2026-10-23）：回执只留这一条任务，不再把全表打一遍。
         // 想看全部时打 `list all`；这一行留着只会让「刚加完」的确认信息淹在列表里。
         // 同时把这条任务记成「最近出现的任务」，作为无参 done/remove 的首选目标（REQ-004）。
@@ -428,14 +456,15 @@ public class TaskEngine {
      * @return 新任务 id；失败返回 null（已在内部报错）
      */
     private String addTask(String title, String note, String triggerType, int priority,
-                           Long triggerAt, Long remindAt, Integer estimate, String recurrenceRule) {
+                           Long triggerAt, Long remindAt, Integer estimate, String recurrenceRule,
+                           boolean hidden) {
         String id = UUID.randomUUID().toString();
         String sql = "INSERT INTO tasks(" +
                 "id,title,note,trigger_type,status,priority," +
                 "trigger_at,remind_at,estimate_minutes," +
                 "recurrence_rule,next_trigger_at,parent_id,last_notified_at," +
-                "created_at,updated_at,done_at) " +
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+                "created_at,updated_at,done_at,hidden) " +
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
         long now = Instant.now(clock).toEpochMilli();
         try {
             SqlTransaction.run(conn, () -> {
@@ -457,6 +486,7 @@ public class TaskEngine {
                     ps.setLong(14, now);
                     ps.setLong(15, now);
                     ps.setNull(16, Types.INTEGER);
+                    ps.setInt(17, hidden ? 1 : 0);
                     ps.executeUpdate();
                 }
                 // §3.5：add 必须进 op_log（含 AI 添加的路径），错误也能撤销
@@ -535,7 +565,8 @@ public class TaskEngine {
 
     /** S3 权威回显（§2.4 R1–R5）：必须写明具体时间、提示 undo、无时间时显式警告、标明是否 AI。 */
     private void echoAdd(String id, String title, int priority, Long triggerAt,
-                         Long remindAt, Integer estimate, boolean aiUsed, String recurrenceRule) {
+                         Long remindAt, Integer estimate, boolean aiUsed, String recurrenceRule,
+                         boolean hidden) {
         StringBuilder sb = new StringBuilder();
         sb.append("[OK] 已添加：").append(title);
         if (aiUsed) sb.append("  （AI 识别）");
@@ -557,6 +588,9 @@ public class TaskEngine {
               .append(Recurrence.untilOf(recurrenceRule) == null
                       ? "（之后一直重复，直到 remove 或 done 后次日复活）"
                       : "（到期后不再重复）");
+        }
+        if (hidden) {   // REQ-022：隐藏任务必须说明「什么时候才会自己浮出来」，否则像加了条空气
+            sb.append("\n     [隐藏] 平时不出现在 list 里，只在它触发的那天冒出来；`list -a` 随时可查");
         }
         out.accept(sb.toString());
     }
@@ -718,6 +752,98 @@ public class TaskEngine {
         }
     }
 
+// ─────────────────────── 每日问候（REQ-021） ───────────────────────
+
+    /**
+     * 给 {@link GreetingService} 读写进度用。复用 meta 表，不另造状态文件
+     * （备份、同步、`undo` 的边界都因此不动）。
+     */
+    public String metaValue(String key) throws SQLException {
+        return metaGet(key);
+    }
+
+    /** 见 {@link #metaValue(String)}。 */
+    public void metaSet(String key, String value) throws SQLException {
+        metaPut(key, value);
+    }
+
+    /**
+     * 拼问候正文（用户裁定的口径：今天到点的 + 已逾期未完成的）。
+     *
+     * <p>隐藏任务（REQ-022）只在自己触发的那一天出现——所以课表任务会出现在当天问候里，
+     * 平时不会；逾期的隐藏任务不列（它本来就不该占用户注意力）。
+     *
+     * <p>QQ 是窄屏，一行一条、不换行折行；标题过长由客户端负责截断。
+     */
+    public String buildGreeting() {
+        ZoneId zone = clock.getZone();
+        LocalDate today = LocalDate.now(clock);
+        long startOfDay = today.atStartOfDay(zone).toInstant().toEpochMilli();
+        long endOfDay = today.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(salutation(LocalTime.now(clock).getHour()))
+          .append("！今天是")
+          .append(today.getYear()).append("年")
+          .append(today.getMonthValue()).append("月")
+          .append(today.getDayOfMonth()).append("日")
+          .append(today.getDayOfWeek().getDisplayName(TextStyle.FULL, Locale.CHINA))
+          .append("。");
+
+        List<String> todayLines = new ArrayList<>();
+        List<String> overdueLines = new ArrayList<>();
+        String sql = "SELECT title, recurrence_rule, hidden, COALESCE(trigger_at, remind_at) AS due "
+                + "FROM tasks WHERE status = 'todo' AND COALESCE(trigger_at, remind_at) IS NOT NULL "
+                + "ORDER BY due ASC";
+        try (PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            DateTimeFormatter hm = DateTimeFormatter.ofPattern("HH:mm");
+            DateTimeFormatter md = DateTimeFormatter.ofPattern("MM-dd");
+            while (rs.next()) {
+                long due = rs.getLong("due");
+                boolean hidden = rs.getInt("hidden") != 0;
+                String title = rs.getString("title");
+                if (due >= startOfDay && due < endOfDay) {
+                    String time = Instant.ofEpochMilli(due).atZone(zone).format(hm);
+                    todayLines.add(time + "  " + title + recurringSuffix(rs.getString("recurrence_rule")));
+                } else if (due < startOfDay && !hidden) {
+                    String day = Instant.ofEpochMilli(due).atZone(zone).format(md);
+                    overdueLines.add(day + "  " + title);
+                }
+            }
+        } catch (SQLException e) {
+            return sb.append("\n（问候生成失败：").append(e.getMessage()).append("）").toString();
+        }
+
+        if (todayLines.isEmpty() && overdueLines.isEmpty()) {
+            return sb.append("\n截至目前，今天没有要做的事，安心。").toString();
+        }
+        if (!todayLines.isEmpty()) {
+            sb.append("\n截至目前，今天要做的事有 ").append(todayLines.size()).append(" 项：");
+            for (String line : todayLines) sb.append("\n  - ").append(line);
+        } else {
+            sb.append("\n截至目前，今天没有计划内的事。");
+        }
+        if (!overdueLines.isEmpty()) {
+            sb.append("\n另有 ").append(overdueLines.size()).append(" 项已逾期未完成：");
+            for (String line : overdueLines) sb.append("\n  - ").append(line);
+        }
+        return sb.toString();
+    }
+
+    /** 按时段选称呼（默认 07:00 / 08:30 都落在「早上好」）。 */
+    private static String salutation(int hour) {
+        if (hour < 11) return "早上好";
+        if (hour < 13) return "中午好";
+        if (hour < 18) return "下午好";
+        return "晚上好";
+    }
+
+    /** 问候里给循环任务加个尾巴，免得用户以为它只做一次。 */
+    private static String recurringSuffix(String rule) {
+        return Recurrence.isRecurring(rule) ? "（" + Recurrence.describe(rule) + "）" : "";
+    }
+
 // ─────────────────────────── next（REQ-004） ───────────────────────────
     /**
      * next —— 回一条「下一条该做」的任务，并把它记成「最近出现的任务」。
@@ -758,7 +884,7 @@ public class TaskEngine {
 
     /** 供 {@link NextSelector} 排序用的待办快照（只读，不改库）。 */
     private java.util.List<NextSelector.Candidate> todoCandidates() throws SQLException {
-        String sql = "SELECT id,title,priority,trigger_at,remind_at,created_at "
+        String sql = "SELECT id,title,priority,trigger_at,remind_at,created_at,hidden "
                 + "FROM tasks WHERE status='todo'";
         java.util.List<NextSelector.Candidate> list = new java.util.ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(sql);
@@ -769,9 +895,11 @@ public class TaskEngine {
                 long remind = rs.getLong("remind_at");
                 Long remindAt = rs.wasNull() ? null : remind;
                 // 时间口径与 ReminderService 一致：trigger_at 优先，其次 remind_at
+                Long due = triggerAt != null ? triggerAt : remindAt;
+                // REQ-022：隐藏任务平时不排队；只有它触发的那一天才进候选
+                if (rs.getInt("hidden") != 0 && (due == null || !isDueToday(due))) continue;
                 list.add(new NextSelector.Candidate(rs.getString("id"), rs.getString("title"),
-                        triggerAt != null ? triggerAt : remindAt,
-                        rs.getInt("priority"), rs.getLong("created_at")));
+                        due, rs.getInt("priority"), rs.getLong("created_at")));
             }
         }
         return list;
@@ -1220,6 +1348,7 @@ public class TaskEngine {
         Integer newPriority = null;
         String newTitle = null;
         String newNote = null;
+        Boolean newHidden = null;   // REQ-022：-hidden / -shown
         while (i < argv.length) {
             String a = argv[i];
             switch (a) {
@@ -1265,13 +1394,20 @@ public class TaskEngine {
                     i = argv.length - 1;
                     break;
                 }
+                case "-hidden":
+                    newHidden = Boolean.TRUE;
+                    break;
+                case "-shown":
+                case "-unhide":
+                    newHidden = Boolean.FALSE;
+                    break;
                 default:
                     return "[错误] set 不认识的开关：" + a + "\n" + SET_USAGE;
             }
             i++;
         }
         if (newTrigger == null && newRemind == null && newPriority == null
-                && newTitle == null && newNote == null) {
+                && newTitle == null && newNote == null && newHidden == null) {
             return "[提示] set 没有任何要改的内容。\n" + SET_USAGE;
         }
 
@@ -1307,8 +1443,9 @@ public class TaskEngine {
         Long triggerAt;
         Long remindAt;
         long lastNotified;
+        boolean hidden;
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT title, note, priority, trigger_at, remind_at, last_notified_at "
+                "SELECT title, note, priority, trigger_at, remind_at, last_notified_at, hidden "
                         + "FROM tasks WHERE id=?")) {
             ps.setString(1, id);
             try (ResultSet rs = ps.executeQuery()) {
@@ -1319,6 +1456,7 @@ public class TaskEngine {
                 triggerAt = readNullableLong(rs, "trigger_at");
                 remindAt = readNullableLong(rs, "remind_at");
                 lastNotified = rs.getLong("last_notified_at");
+                hidden = rs.getInt("hidden") != 0;
             }
         }
 
@@ -1347,13 +1485,15 @@ public class TaskEngine {
         List<Object> vals = new ArrayList<>();
         boolean priorityChanged = newPriority != null && newPriority != priority;
         boolean noteChanged = newNote != null && !newNote.equals(note);
+        boolean hiddenChanged = newHidden != null && newHidden != hidden;
         if (renaming) { sets.add("title=?"); vals.add(newTitle); }
         if (noteChanged) { sets.add("note=?"); vals.add(newNote); }
         if (priorityChanged) { sets.add("priority=?"); vals.add(newPriority); }
+        if (hiddenChanged) { sets.add("hidden=?"); vals.add(newHidden ? 1 : 0); }
         if (newTrigger != null) { sets.add("trigger_at=?"); vals.add(newTrigger); }
         if (newRemind != null) { sets.add("remind_at=?"); vals.add(newRemind); }
         // 注意：updated_at 每次都会写，所以不能拿 sets.size() 判断「有没有实际改动」。
-        if (!renaming && !noteChanged && !priorityChanged && !timeChanged) {
+        if (!renaming && !noteChanged && !priorityChanged && !hiddenChanged && !timeChanged) {
             return "[提示] 没有实际改动（值本来就是这些）。";
         }
         sets.add("updated_at=?"); vals.add(now);
@@ -1393,11 +1533,108 @@ public class TaskEngine {
             sb.append("\n     备注 ").append(note == null ? "（原本没有）" : note)
                     .append(" → ").append(newNote);
         }
+        if (hiddenChanged) {
+            sb.append("\n     隐藏 ").append(hidden ? "是" : "否").append(" → ").append(newHidden ? "是" : "否");
+            if (newHidden) sb.append("（平时不出现在 list 里，只在它触发的那天冒出来；`list -a` 随时可查）");
+        }
         if (timeChanged && lastNotified != 0) {
             sb.append("\n     提醒已重新武装：新时间到了会再提醒一次");
         }
         sb.append("\n     （改错了发 undo 撤销）");
         return sb.toString();
+    }
+
+    // ─────────────────────────── greet：每日问候（REQ-021） ───────────────────────────
+
+    /**
+     * greet —— 每日问候的配置与手工触发。
+     *
+     * <p>正文由 {@link #buildGreeting()} 生成、发送时机由 {@link GreetingService} 负责；
+     * 这里只做三件事：看状态、改时间/开关、立刻发一条验收用。
+     */
+    private void handleGreet(String[] argv) {
+        try {
+            if (argv.length == 0) {
+                boolean enabled = AppSettings.getBool(GreetingService.KEY_ENABLED, true);
+                String wd = AppSettings.get(GreetingService.KEY_WORKDAY, GreetingService.DEFAULT_WORKDAY);
+                String hd = AppSettings.get(GreetingService.KEY_HOLIDAY, GreetingService.DEFAULT_HOLIDAY);
+                boolean dayOff;
+                try {
+                    dayOff = HolidayCalendar.atHome(out::accept).isDayOff(LocalDate.now(clock));
+                } catch (RuntimeException e) {
+                    dayOff = false;
+                }
+                String last = metaValue(GreetingService.META_LAST_SENT);
+                StringBuilder sb = new StringBuilder("[每日问候] ");
+                sb.append(enabled ? "已开启" : "已关闭");
+                sb.append("\n     工作日 ").append(wd).append(" ｜ 节假日 ").append(hd);
+                sb.append("\n     今天按").append(dayOff ? "节假日" : "工作日")
+                  .append("处理 → 问候时间 ").append(dayOff ? hd : wd);
+                sb.append("\n     最近一次发送：").append(last == null || last.isBlank() ? "（今天还没发过）" : last);
+                sb.append("\n     改时间：greet 7:30（工作日）｜ greet holiday 8:30 ｜ greet on|off ｜ greet test");
+                out.accept(sb.toString());
+                return;
+            }
+            String sub = argv[0].toLowerCase();
+            switch (sub) {
+                case "on":
+                    AppSettings.set(GreetingService.KEY_ENABLED, "true");
+                    out.accept("[OK] 每日问候已开启（守护进程 30 秒内读到新设置，不必重启）");
+                    return;
+                case "off":
+                    AppSettings.set(GreetingService.KEY_ENABLED, "false");
+                    out.accept("[OK] 每日问候已关闭");
+                    return;
+                case "test": {
+                    java.util.function.Function<String, Boolean> push = greetPusher;
+                    if (push == null) {
+                        out.accept("[提示] 当前没有可用的发送通道（QQ 未启动，或本进程不是守护进程）");
+                        return;
+                    }
+                    String text = buildGreeting();
+                    boolean ok = push.apply(text);
+                    out.accept(ok ? "[OK] 已发送一条问候（不算今天的正式发送）\n" + text
+                                  : "[提示] 发送失败，见日志\n" + text);
+                    return;
+                }
+                case "holiday": {
+                    if (argv.length < 2) { out.accept("[错误] 用法：greet holiday 8:30"); return; }
+                    LocalTime t = parseClock(argv[1]);
+                    if (t == null) { out.accept("[错误] 时间要写成 8:30 或 08:30，得到：" + argv[1]); return; }
+                    AppSettings.set(GreetingService.KEY_HOLIDAY, fmtClock(t));
+                    out.accept("[OK] 节假日问候时间已设为 " + fmtClock(t));
+                    return;
+                }
+                default: {
+                    LocalTime t = parseClock(sub);
+                    if (t == null) {
+                        out.accept("[错误] greet 不认识的参数：" + argv[0]
+                                + "\n        用法：greet ｜ greet on|off ｜ greet 7:30 ｜ greet holiday 8:30 ｜ greet test");
+                        return;
+                    }
+                    AppSettings.set(GreetingService.KEY_WORKDAY, fmtClock(t));
+                    out.accept("[OK] 工作日问候时间已设为 " + fmtClock(t));
+                }
+            }
+        } catch (Exception e) {
+            out.accept("[错误] greet 失败：" + e.getMessage());
+        }
+    }
+
+    /** 认 {@code 7:30} / {@code 07:30} / 全角冒号；不合法返回 null。 */
+    private static LocalTime parseClock(String s) {
+        if (s == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("^(\\d{1,2})[:：](\\d{1,2})$").matcher(s.trim());
+        if (!m.matches()) return null;
+        int h = Integer.parseInt(m.group(1));
+        int mi = Integer.parseInt(m.group(2));
+        if (h > 23 || mi > 59) return null;
+        return LocalTime.of(h, mi);
+    }
+
+    private static String fmtClock(LocalTime t) {
+        return String.format("%02d:%02d", t.getHour(), t.getMinute());
     }
 
     // ─────────────────────────── export ───────────────────────────
@@ -1482,23 +1719,41 @@ public class TaskEngine {
      */
     private void handleList(String[] argv) {
         // BUG-023：原实现只读 argv[0]，list done extra 会静默忽略多余参数。
-        if (argv.length > 1) {
-            out.accept("[提示] list 只接受一个参数，收到 " + argv.length + " 个："
-                    + String.join(" ", argv) + "\n        用法：list ｜ list todo|done|removed|all");
+        // REQ-022：`-a` = 连隐藏任务一起显示（对齐 `ls -a`），可与状态参数任意组合。
+        boolean showHidden = false;
+        List<String> positional = new ArrayList<>();
+        for (String a : argv) {
+            if (a == null || a.isEmpty()) continue;
+            if ("-a".equals(a) || "--all-hidden".equals(a)) {
+                showHidden = true;
+                continue;
+            }
+            if (a.startsWith("-")) {
+                out.accept("[提示] 未知的 list 开关：" + a
+                        + "\n        用法：list ｜ list todo|done|removed|all ｜ 后面可加 -a 连隐藏任务一起看");
+                return;
+            }
+            positional.add(a);
+        }
+        if (positional.size() > 1) {
+            out.accept("[提示] list 只接受一个参数，收到 " + positional.size() + " 个："
+                    + String.join(" ", positional)
+                    + "\n        用法：list ｜ list todo|done|removed|all ｜ 后面可加 -a");
             return;
         }
-        String arg = (argv.length > 0 && argv[0] != null) ? argv[0].toLowerCase() : "";
+        String arg = positional.isEmpty() ? "" : positional.get(0).toLowerCase();
         boolean all = "all".equals(arg);
         String status = all ? null : (arg.isEmpty() ? "todo" : arg);
         if (status != null && !isKnownStatus(status)) {
-            out.accept("[提示] 未知的 list 参数：" + argv[0]
-                    + "\n        可用：list（= TODO）｜ list done ｜ list removed ｜ list all");
+            out.accept("[提示] 未知的 list 参数：" + positional.get(0)
+                    + "\n        可用：list（= TODO）｜ list done ｜ list removed ｜ list all ｜ 再加 -a 看隐藏");
             return;
         }
         String where = all ? "status != 'removed'" : "status = ?";
-        String sql = "SELECT id, title, note, status, priority, trigger_type, recurrence_rule, " +
+        String sql = "SELECT id, title, note, status, priority, trigger_type, recurrence_rule, hidden, " +
                 "CASE WHEN trigger_at IS NULL THEN '' " +
-                "     ELSE datetime(trigger_at/1000, 'unixepoch', 'localtime') END AS due " +
+                "     ELSE datetime(trigger_at/1000, 'unixepoch', 'localtime') END AS due, " +
+                "COALESCE(trigger_at, remind_at) AS due_ms " +
                 "FROM tasks WHERE " + where + " ORDER BY created_at ASC";
         int n = 0;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -1507,10 +1762,15 @@ public class TaskEngine {
             try (ResultSet rs = ps.executeQuery()) {
                 StringBuilder sb = new StringBuilder(listHeader(status));
                 while (rs.next()) {
+                    boolean hid = rs.getInt("hidden") != 0;
+                    String st = rs.getString("status");
+                    // 隐藏任务只在「自己触发的那一天」浮现；-a 无条件全给。
+                    if (hid && !showHidden && "todo".equals(st) && !isDueToday(rs.getLong("due_ms"))) {
+                        continue;
+                    }
                     n++;
                     String title = rs.getString("title");
                     String note = rs.getString("note");
-                    String st = rs.getString("status");
                     String type = rs.getString("trigger_type");
                     int priority = rs.getInt("priority");
                     String due = rs.getString("due").trim();
@@ -1519,17 +1779,45 @@ public class TaskEngine {
                     if (!due.isEmpty()) sb.append(" DDL ").append(due);
                     String rec = rs.getString("recurrence_rule");
                     if (Recurrence.isRecurring(rec)) sb.append("  [循环] ").append(Recurrence.describe(rec));
+                    if (hid) sb.append("  [隐藏]");
                     sb.append("  ").append(title);
                     if (note != null && !note.isEmpty()) sb.append("  ").append(note);
                     if (active != null && rs.getString("id").equals(active.taskId()))
                         sb.append("  ⏱ ").append(WorkTimer.duration(clock.millis() - active.startedAt()));
                 }
-                if (n == 0) sb.append("\n  ").append(listEmptyHint(status));
+                if (n == 0) {
+                    sb.append("\n  ").append(listEmptyHint(status));
+                    // 隐藏任务不是消失了，是今天没轮到它 —— 明说，免得用户以为丢任务
+                    int hiddenCount = showHidden ? 0 : countHiddenTodos();
+                    if (hiddenCount > 0) {
+                        sb.append("\n  （另有 ").append(hiddenCount).append(" 条隐藏任务，`list -a` 查看）");
+                    }
+                }
                 if (active != null && active.taskId() == null) sb.append("\n活动（非任务）：").append(workTimer.describe(active));
                 out.accept(sb.toString());
             }
         } catch (SQLException e) {
             out.accept("[错误] list 失败: " + e.getMessage());
+        }
+    }
+
+    /** REQ-022：这一毫秒落在「今天」吗（隐藏任务的浮现判据）。 */
+    private boolean isDueToday(long dueMs) {
+        if (dueMs <= 0) return false;
+        LocalDate today = LocalDate.now(clock);
+        LocalDate d = Instant.ofEpochMilli(dueMs).atZone(clock.getZone()).toLocalDate();
+        return today.equals(d);
+    }
+
+    /** REQ-022：还有多少隐藏的 TODO（空列表时给用户一句提示用）。 */
+    private int countHiddenTodos() {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT COUNT(*) FROM tasks WHERE status='todo' AND hidden=1")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        } catch (SQLException e) {
+            return 0;
         }
     }
 
@@ -1581,18 +1869,23 @@ public class TaskEngine {
     // ─────────────────────────── help ───────────────────────────
     private void handleHelp(String[] argv) {
         out.accept("用法：\n"
-            + "  add <标题> [-p 优先级1-9] [-g once|recurring|ongoing] [-t 触发时刻] [-a 提醒时刻] [-n 备注]\n"
+            + "  add <标题> [-p 优先级1-9] [-g once|recurring|ongoing] [-t 触发时刻] [-a 提醒时刻] [-n 备注] [-hidden]\n"
             + "      注意：-n 必须放在最后，其后所有内容都会作为备注；未知开关（如 -x）会直接报错\n"
             + "      循环：-r 1d|1w|1mo 需配 -t（-t 的时分秒＝每次几点），-until 截止时刻，例：\n"
             + "        add 每天晚上提醒 -r 1d -t year2026 month11 day1 time21:00\n"
+            + "      隐藏：-hidden 平时不出现在 list/next 里，只在它触发的那天冒出来（课表就用这个）\n"
             + "  list | ls          —— 列出待办任务（TODO，默认）\n"
             + "  list done|removed|all  —— 列出 已完成 / 已移除 / 全部（TODO+DONE）\n"
+            + "      加 -a（--all-hidden）连隐藏任务一起列出，如：list -a、list all -a\n"
             + "  next               —— 下一条该做的任务（时间最近 + 优先级可插队）\n"
             + "  done [任务名]      —— 完成任务；留空时目标＝计时中的活动 > 最近出现的任务 > 上次提醒的 > next\n"
             + "  remove [任务名]    —— 移除任务；留空的取法同 done\n"
             + "  push [任务名] [增量] —— 平移任务时间（+推迟/-提前，如 1h、2d、-30m；省略增量=推迟一天）\n"
             + "  set [任务名] [开关…] —— 改已有任务的属性：-t DDL / -a 提醒 / -p 优先级 / -title 新标题 / -n 备注\n"
+            + "      -hidden 设为隐藏 / -shown 取消隐藏\n"
             + "      例：set 考试 -t month11 day2 -p 2；set 高数当周作业 -title 高数作业 -n 记错了\n"
+            + "  greet              —— 每日问候：看状态；greet on|off 开关；greet 7:30 设工作日时间；\n"
+            + "      greet holiday 8:30 设节假日时间；greet test 立即发一条（验证用）\n"
             + "  undo               —— 撤销最近一次 add/remove/done/push/set（安全网，重启后仍有效）\n"
             + "  working | w <活动名> —— 开始/切换计时；无参查看当前或继续最近活动\n"
             + "  pause | p          —— 暂停当前活动；计时区间不随 undo 回滚\n"
@@ -1619,6 +1912,8 @@ public class TaskEngine {
             st.execute(OpLogKit.DDL_OP_LOG);
             st.execute(OpLogKit.IDX_OP_LOG);
             WorkTimer.initSchema(conn);
+            // REQ-022：老库补 hidden 列（CREATE TABLE IF NOT EXISTS 对已存在的表不起作用）
+            ensureColumn(conn, "tasks", "hidden", "INTEGER NOT NULL DEFAULT 0");
         }
         try (PreparedStatement ps = conn.prepareStatement(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '2')")) {
@@ -1627,6 +1922,29 @@ public class TaskEngine {
         try (PreparedStatement ps = conn.prepareStatement(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('timing_schema_version', '1')")) {
             ps.executeUpdate();
+        }
+    }
+
+    /**
+     * 给已存在的表补一列（幂等）。
+     * <p>SQLite 没有 {@code ADD COLUMN IF NOT EXISTS}，只能先查 {@code PRAGMA table_info}。
+     * 不用「先 ALTER 再吞异常」的写法：那会把「真的加失败」也一起吞掉。
+     */
+    private static void ensureColumn(Connection conn, String table, String column, String decl)
+            throws SQLException {
+        boolean exists = false;
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA table_info(" + table + ")")) {
+            while (rs.next()) {
+                if (column.equalsIgnoreCase(rs.getString("name"))) {
+                    exists = true;
+                    break;
+                }
+            }
+        }
+        if (exists) return;
+        try (Statement st = conn.createStatement()) {
+            st.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + decl + ";");
         }
     }
 

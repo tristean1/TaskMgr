@@ -66,6 +66,13 @@ try {
     $syncExit = $LASTEXITCODE
     Get-Content -Encoding UTF8 $syncResults
     if ($syncExit -ne 0) { throw 'Sync / REQ-020 tests failed' }
+    # 2026-11-07 REQ-021（每日问候）+ REQ-022（隐藏任务）
+    # 注意：GreetTest 自己把 taskmgr.home 指到临时目录，并用 setAutoSync(false) 关掉联网。
+    $greetResults = Join-Path $timingResults 'greet-results.txt'
+    & java '-Dfile.encoding=UTF-8' -cp $timingCp GreetTest $timingResults
+    $greetExit = $LASTEXITCODE
+    Get-Content -Encoding UTF8 $greetResults
+    if ($greetExit -ne 0) { throw 'Greet / REQ-021+022 tests failed' }
 } finally {
     Pop-Location
 }

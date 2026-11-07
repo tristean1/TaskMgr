@@ -51,6 +51,14 @@ public class Main {
             // 本地弹窗通道：无头环境或 settings.properties 里 local.popup=0 时为空实现
             reminder.setAlerter(LocalAlert.alerter());
             reminder.start(0, 10_000L);
+
+            // REQ-021：每日问候（控制台模式下同样生效；没有 QQ 时发不出去，会重试到 12:00）
+            HolidayCalendar holidays = HolidayCalendar.atHome(System.out::println);
+            GreetingService greeting = new GreetingService(engine, holidays,
+                    java.time.Clock.systemDefaultZone(), System.out::println);
+            greeting.setPush(() -> qqHost != null && qqHost.isUp() ? qqHost::pushRemind : null);
+            engine.setGreetPusher(text -> qqHost != null && qqHost.isUp() && qqHost.pushRemind(text));
+            greeting.start();
 // 每日自动导出 .ics（手机兜底）：启动时先导一次，之后每 6 小时重导（幂等，容错覆盖“每天至少一次”）
             java.util.concurrent.ScheduledExecutorService icsTimer =
                     java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
@@ -98,6 +106,7 @@ public class Main {
             } finally {
                 reminder.stop();
                 icsTimer.shutdownNow();
+                greeting.close();
                 if (qqHost != null) qqHost.close();
                 engine.shutdownTiming(System.out::println);
                 try { Runtime.getRuntime().removeShutdownHook(timingShutdown); }

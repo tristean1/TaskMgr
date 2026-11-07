@@ -83,6 +83,9 @@ public class Daemon {
     private ScheduledExecutorService icsTimer;
     /** 第 2 期：QQ 机器人托管（懒开启，{@code task qqbot up} 才连网）。 */
     private QqBotHost qqbotHost;
+    /** REQ-021：节假日日历 + 每日问候。 */
+    private HolidayCalendar holidays;
+    private GreetingService greeting;
 
     public static void main(String[] args) throws Exception {
         Thread.setDefaultUncaughtExceptionHandler((t, e) ->
@@ -220,7 +223,7 @@ public class Daemon {
         engine.setOutput(this::event);
 
         reminder = new ReminderService(conn);
-        reminder.setLogger(this::event);
+        reminder.setLogger(this::eventAndLog);   // 没人连着窗口时也要留痕
         reminder.setOnTick(() -> engine.timingTick(this::event));
         // 本地弹窗通道：无头环境（云服务器）或 settings.properties 里 local.popup=0 时为空实现
         reminder.setAlerter(LocalAlert.alerter());
@@ -231,6 +234,13 @@ public class Daemon {
 
         // 第 2 期：QQ 机器人懒托管。这里只建壳，真正连网要等 task qqbot up。
         qqbotHost = new QqBotHost(String.valueOf(DaemonEndpoint.dbPath()), this::event);
+
+        // REQ-021：每日问候。只在有发送通道（QQ 在线）时才发；错过则重试到 12:00。
+        holidays = HolidayCalendar.atHome(this::eventAndLog);
+        greeting = new GreetingService(engine, holidays, java.time.Clock.systemDefaultZone(), this::eventAndLog);
+        greeting.setPush(() -> qqbotHost.isUp() ? qqbotHost::pushRemind : null);
+        engine.setGreetPusher(text -> qqbotHost.isUp() && qqbotHost.pushRemind(text));
+        greeting.start();
 
         icsTimer = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "ics-exporter");
@@ -254,6 +264,27 @@ public class Daemon {
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "daemon-shutdown"));
         say("[守护进程] 已启动 pid=" + ProcessHandle.current().pid()
                 + " socket=" + DaemonEndpoint.socketPath());
+
+        // 服务器上重启后 QQ 不会自己起来 —— 而提醒和问候全靠它，于是"重启一次，全部哑掉"
+        // 且没人会发现（2026-11-07 实测踩到）。用显式设置项控制，默认关：
+        // 笔记本上用户随手 task qqbot up，服务器上在 settings.properties 里写 qqbot.autostart=1。
+        if (AppSettings.getBool("qqbot.autostart", false)) {
+            Thread boot = new Thread(() -> {
+                try {
+                    Thread.sleep(3000);   // 让 socket/锁/库先就位，再登录
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                try {
+                    eventAndLog("[QQ] 自启（qqbot.autostart=1）：" + qqbotCommand("up"));
+                } catch (Throwable e) {
+                    eventAndLog("[QQ] 自启失败：" + e);
+                }
+            }, "qqbot-autostart");
+            boot.setDaemon(true);
+            boot.start();
+        }
 
         acceptLoop();
         shutdown();
@@ -335,6 +366,21 @@ public class Daemon {
         broadcast(o.toString());
     }
 
+    /**
+     * 既要广播给窗口，也要落到日志。
+     *
+     * <p><b>为什么必须分开</b>：{@link #event} 只广播给已连接的客户端，
+     * 没人连着时消息**直接消失**——而服务器上恰恰常年没人开窗口。
+     * 2026-11-07 实测：问候确实发出去了（QQ 有回执），但 daemon.log 里连一行
+     * 「[问候] 已发送」都找不到，只有 QQ 自己打的发送记录。排查这类问题时
+     * “日志里没有”会被误读成“没执行”。
+     */
+    private void eventAndLog(String text) {
+        if (text == null || text.isEmpty()) return;
+        log(text);
+        event(text);
+    }
+
     private void broadcast(String json) {
         for (Conn c : conns) c.send(json);
     }
@@ -360,6 +406,10 @@ public class Daemon {
         } catch (Throwable ignored) {
         }
         if (icsTimer != null) icsTimer.shutdownNow();
+        try {
+            if (greeting != null) greeting.close();
+        } catch (Throwable ignored) {
+        }
         try {
             if (qqbotHost != null) qqbotHost.close();
         } catch (Throwable ignored) {

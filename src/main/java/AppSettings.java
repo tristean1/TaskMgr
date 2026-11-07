@@ -1,4 +1,5 @@
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -81,5 +82,66 @@ public final class AppSettings {
             case "0", "false", "no", "off", "否", "关" -> false;
             default -> def;
         };
+    }
+
+    /**
+     * 写一个键（保留文件里其它行与注释）。
+     *
+     * <p>写成功后立刻清缓存，所以 {@code greet 7:30} 这种命令**当场生效**，不必重启进程。
+     * 文件不存在时新建；出现 IO 错误抛出（由调用方翻成一句人话，而不是静默失败）。
+     */
+    public static synchronized void set(String key, String value) {
+        if (key == null || key.isBlank()) throw new IllegalArgumentException("键不能为空");
+        Path p = path();
+        StringBuilder sb = new StringBuilder();
+        boolean replaced = false;
+        try {
+            if (Files.exists(p)) {
+                String text = Files.readString(p, StandardCharsets.UTF_8);
+                if (!text.isEmpty() && text.charAt(0) == '\uFEFF') text = text.substring(1);
+                for (String raw : text.split("\\R")) {
+                    String line = raw.trim();
+                    if (!line.isEmpty() && !line.startsWith("#") && !line.startsWith("!")) {
+                        int eq = line.indexOf('=');
+                        if (eq > 0 && line.substring(0, eq).trim().equals(key)) {
+                            sb.append(key).append('=').append(value).append('\n');
+                            replaced = true;
+                            continue;   // 后面的同名行也一并改写，避免出现两条互相打架
+                        }
+                    }
+                    sb.append(raw).append('\n');
+                }
+            }
+            if (!replaced) sb.append(key).append('=').append(value).append('\n');
+            Path parent = p.getParent();
+            if (parent != null) Files.createDirectories(parent);
+            Files.writeString(p, sb.toString(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException("写设置文件失败：" + p, e);
+        }
+        cache = null;
+    }
+
+    /** 删一个键（不存在的键当成功）。 */
+    public static synchronized void remove(String key) {
+        Path p = path();
+        if (!Files.exists(p)) { cache = null; return; }
+        StringBuilder sb = new StringBuilder();
+        try {
+            String text = Files.readString(p, StandardCharsets.UTF_8);
+            if (!text.isEmpty() && text.charAt(0) == '\uFEFF') text = text.substring(1);
+            for (String raw : text.split("\\R")) {
+                String line = raw.trim();
+                if (!line.isEmpty() && !line.startsWith("#") && !line.startsWith("!")) {
+                    int eq = line.indexOf('=');
+                    if (eq > 0 && line.substring(0, eq).trim().equals(key)) continue;
+                }
+                sb.append(raw).append('\n');
+            }
+            Files.writeString(p, sb.toString(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException("写设置文件失败：" + p, e);
+        }
+        cache = null;
     }
 }
