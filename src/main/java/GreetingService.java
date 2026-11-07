@@ -127,7 +127,7 @@ public final class GreetingService implements AutoCloseable {
         boolean ok;
         try {
             Boolean r = pushFn.apply(text);
-            ok = (r == null) || r;
+            ok = Boolean.TRUE.equals(r);
         } catch (RuntimeException e) {
             log.accept("[问候] 推送异常：" + e.getMessage());
             return;                          // 保留未发送状态，下一轮重试

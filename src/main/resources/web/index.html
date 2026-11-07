@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>任务</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --line: #e3e6ea; --ink: #1f2328;
+    --dim: #6b7280; --accent: #2f6feb; --warn: #b45309; --danger: #b42318;
+    --chip: #eef2f7;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.55 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 18px 16px 60px; }
+  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  h1 { font-size: 18px; margin: 0 8px 0 0; font-weight: 650; }
+  .tabs { display: flex; gap: 2px; background: var(--chip); padding: 3px; border-radius: 8px; }
+  .tabs button { border: 0; background: transparent; padding: 5px 12px; border-radius: 6px;
+                 cursor: pointer; color: var(--dim); font-size: 13px; }
+  .tabs button.on { background: #fff; color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .spacer { flex: 1; }
+  button.btn { border: 1px solid var(--line); background: #fff; color: var(--ink);
+               padding: 6px 13px; border-radius: 7px; cursor: pointer; font-size: 13px; }
+  button.btn:hover { border-color: #c9ced6; background: #fafbfc; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #2a63d4; }
+  button.link { border: 0; background: none; color: var(--accent); cursor: pointer;
+                padding: 0 6px; font-size: 13px; }
+  button.link.danger { color: var(--danger); }
+  button.link.confirming { color: #fff; background: var(--danger); border-radius: 5px;
+                           padding: 2px 9px; font-weight: 600; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  #editor { margin-bottom: 14px; }
+  .grid { display: grid; grid-template-columns: 96px 1fr; gap: 9px 12px; align-items: center; }
+  .grid label { color: var(--dim); font-size: 13px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input[type=text], input[type=datetime-local], select {
+    border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px;
+    font: inherit; color: inherit; background: #fff; min-width: 220px;
+  }
+  input[type=text]:focus, input[type=datetime-local]:focus, select:focus {
+    outline: 2px solid #cfe0ff; border-color: var(--accent);
+  }
+  .hint { color: var(--dim); font-size: 12px; }
+  .quick button { font-size: 12px; padding: 3px 9px; }
+
+  ul.tasks { list-style: none; margin: 12px 0 0; padding: 0; }
+  ul.tasks li { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+                padding: 11px 14px; margin-bottom: 8px; display: flex; gap: 12px; align-items: flex-start; }
+  ul.tasks li.done { opacity: .55; }
+  .main { flex: 1; min-width: 0; }
+  .title { font-size: 14.5px; font-weight: 600; word-break: break-word; }
+  .meta { color: var(--dim); font-size: 12.5px; margin-top: 3px; display: flex;
+          gap: 10px; flex-wrap: wrap; align-items: center; }
+  .chip { background: var(--chip); border-radius: 5px; padding: 1px 7px; font-size: 12px; color: #475467; }
+  .chip.due { background: #eef6ff; color: #1d4ed8; }
+  .chip.late { background: #fff1f0; color: var(--danger); }
+  .chip.hidden0 { background: #f4f1ff; color: #5b3ec8; }
+  .chip.rec { background: #eefaf1; color: #15803d; }
+  .chip.work { background: #fff7e6; color: var(--warn); }
+  .note { color: #475467; font-size: 12.5px; margin-top: 4px; word-break: break-word; }
+  .acts { display: flex; gap: 2px; flex-shrink: 0; }
+  #msg { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+         background: #1f2328; color: #fff; padding: 9px 16px; border-radius: 8px;
+         font-size: 13px; max-width: 80vw; white-space: pre-wrap; opacity: 0;
+         transition: opacity .18s; pointer-events: none; z-index: 9; }
+  #msg.on { opacity: .95; }
+  #msg.err { background: #7a1c15; }
+  #msg .act { pointer-events: auto; margin-left: 10px; border: 0; border-radius: 5px;
+              background: #fff; color: #1f2328; padding: 2px 9px; font: inherit;
+              font-size: 12px; cursor: pointer; }
+  .empty { color: var(--dim); text-align: center; padding: 30px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>任务</h1>
+    <div class="tabs" id="tabs">
+      <button data-scope="today" class="on" title="等价于命令 list（全部待办，不只今天）">待办</button>
+      <button data-scope="all">全部</button>
+      <button data-scope="hidden">含隐藏</button>
+      <button data-scope="done">已完成</button>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn" id="refresh">刷新</button>
+    <button class="btn primary" id="newTask">新建任务</button>
+  </header>
+
+  <section class="card" id="editor" hidden>
+    <form id="form" autocomplete="off">
+      <div class="grid">
+        <label for="f_title">标题</label>
+        <div><input type="text" id="f_title" placeholder="要做什么" style="width:100%"></div>
+
+        <label for="f_due">时间</label>
+        <div class="row">
+          <input type="datetime-local" id="f_due">
+          <span class="row quick">
+            <button type="button" class="btn" data-quick="today">今天</button>
+            <button type="button" class="btn" data-quick="tomorrow">明天</button>
+            <button type="button" class="btn" data-quick="dayafter">后天</button>
+            <button type="button" class="btn" data-quick="nextweek">下周</button>
+            <button type="button" class="btn" data-quick="clear">清除</button>
+          </span>
+        </div>
+
+        <label for="f_pri">优先级</label>
+        <div><select id="f_pri">
+          <option value="1">1（默认）</option><option value="2">2</option><option value="3">3</option>
+          <option value="4">4</option><option value="5">5</option><option value="6">6</option>
+          <option value="7">7</option><option value="8">8</option><option value="9">9</option>
+        </select></div>
+
+        <label for="f_rule">循环</label>
+        <div class="row">
+          <select id="f_rule">
+            <option value="">不循环</option>
+            <option value="1h">每小时</option>
+            <option value="1d">每天</option>
+            <option value="1w">每周</option>
+            <option value="1mo">每月</option>
+          </select>
+          <span class="hint" id="untilWrap" hidden>结束于 <input type="datetime-local" id="f_until"></span>
+          <span class="hint">循环次日起按「上一次 + 周期」推进；只支持新建时设定</span>
+        </div>
+
+        <label for="f_note">备注</label>
+        <div><input type="text" id="f_note" placeholder="可留空" style="width:100%"></div>
+
+        <label>隐藏</label>
+        <div class="row">
+          <label class="row" style="gap:6px">
+            <input type="checkbox" id="f_hidden">
+            <span class="hint">平时不出现在列表与 next 里，只在它触发的那天冒出来</span>
+          </label>
+        </div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button type="submit" class="btn primary" id="save">保存</button>
+        <button type="button" class="btn" id="cancel">取消</button>
+        <span class="hint" id="editHint" hidden></span>
+      </div>
+    </form>
+  </section>
+
+  <main>
+    <ul class="tasks" id="list"></ul>
+    <div class="empty" id="empty" hidden>这里没有任务</div>
+  </main>
+</div>
+<div id="msg"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let scope = 'today';
+let editing = null;     // null | 原对象（编辑）
+let msgTimer = null;
+
+function toast(text, isErr, action) {
+  const m = $('msg');
+  m.innerHTML = '';
+  const span = document.createElement('span');
+  span.textContent = text;
+  m.appendChild(span);
+  if (action) {
+    const a = document.createElement('button');
+    a.className = 'act';
+    a.textContent = action.label;
+    a.onclick = () => { m.className = ''; action.fn(); };
+    m.appendChild(a);
+  }
+  m.className = 'on' + (isErr ? ' err' : '');
+  clearTimeout(msgTimer);
+  msgTimer = setTimeout(() => { m.className = ''; }, isErr ? 6000 : action ? 7000 : 2600);
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({ cache: 'no-store' }, opts || {}));
+  return r.json();
+}
+
+async function load() {
+  let data;
+  try {
+    data = await api('/api/tasks?scope=' + encodeURIComponent(scope));
+  } catch (e) {
+    toast('拉取失败：' + e, true);
+    return;
+  }
+  if (data.error) { toast(data.error, true); render([]); return; }
+  render(data);
+}
+
+function pad(n) { return String(n).padStart(2, '0'); }
+function fmt(ms) {
+  const d = new Date(ms);
+  const now = new Date();
+  const sameYear = d.getFullYear() === now.getFullYear();
+  const head = (sameYear ? '' : d.getFullYear() + '-') + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  const t = pad(d.getHours()) + ':' + pad(d.getMinutes());
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const day = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const diff = Math.round((day - today) / 86400000);
+  const rel = diff === 0 ? '今天' : diff === 1 ? '明天' : diff === -1 ? '昨天'
+            : diff > 1 && diff < 7 ? diff + ' 天后' : diff < -1 && diff > -7 ? (-diff) + ' 天前' : '';
+  return (rel ? rel + ' ' : '') + head + ' ' + t;
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function render(rows) {
+  const ul = $('list');
+  disarm();
+  ul.innerHTML = '';
+  $('empty').hidden = rows.length > 0;
+  const now = Date.now();
+  for (const t of rows) {
+    const li = document.createElement('li');
+    if (t.status !== 'todo') li.className = 'done';
+    const chips = [];
+    if (t.due) {
+      const late = t.status === 'todo' && t.due < now;
+      chips.push('<span class="chip ' + (late ? 'late' : 'due') + '">' + (late ? '已逾期 ' : '') + esc(fmt(t.due)) + '</span>');
+    }
+    if (t.priority > 1) chips.push('<span class="chip">优先级 ' + t.priority + '</span>');
+    if (t.rule) chips.push('<span class="chip rec">' + esc(ruleText(t.rule)) + '</span>');
+    if (t.hidden) chips.push('<span class="chip hidden0">隐藏</span>');
+    if (t.working) chips.push('<span class="chip work">计时中</span>');
+    if (t.status !== 'todo') chips.push('<span class="chip">' + esc(t.status) + '</span>');
+
+    li.innerHTML =
+      '<div class="main">' +
+        '<div class="title">' + esc(t.title) + '</div>' +
+        (chips.length ? '<div class="meta">' + chips.join('') + '</div>' : '') +
+        (t.note ? '<div class="note">' + esc(t.note) + '</div>' : '') +
+      '</div>' +
+      '<div class="acts"></div>';
+
+    const acts = li.querySelector('.acts');
+    if (t.status === 'todo') {
+      acts.appendChild(btn('完成', () => run('done ' + t.title)));
+      acts.appendChild(btn('+1h', () => run('push ' + t.title + ' 1h')));
+      acts.appendChild(btn('+1d', () => run('push ' + t.title + ' 1d')));
+      acts.appendChild(btn('编辑', () => startEdit(t)));
+      acts.appendChild(dangerAction('删除', '确认删除？', () => run('remove ' + t.title)));
+    }
+    ul.appendChild(li);
+  }
+}
+
+function btn(label, fn, cls) {
+  const b = document.createElement('button');
+  b.className = 'link' + (cls ? ' ' + cls : '');
+  b.textContent = label;
+  b.onclick = fn;
+  return b;
+}
+
+// 危险操作要点两下：第一下把按钮变成「确认…？」，5 秒内不再点就自己收回。
+// 这样误点到别的行时，会先看到那一行弹成红底的确认态，而不是直接删掉。
+let armed = null;
+let armedTimer = null;
+
+function disarm() {
+  if (armed) {
+    armed.textContent = armed.dataset.label;
+    armed.classList.remove('confirming');
+  }
+  armed = null;
+  clearTimeout(armedTimer);
+}
+
+function dangerAction(label, confirmLabel, fn) {
+  const b = btn(label, null, 'danger');
+  b.dataset.label = label;
+  b.onclick = (ev) => {
+    ev.stopPropagation();
+    if (armed === b) { disarm(); fn(); return; }
+    disarm();
+    armed = b;
+    b.textContent = confirmLabel;
+    b.classList.add('confirming');
+    armedTimer = setTimeout(disarm, 5000);
+  };
+  return b;
+}
+
+document.addEventListener('click', (ev) => {
+  if (armed && !armed.contains(ev.target)) disarm();
+});
+
+function ruleText(r) {
+  const period = r.split(';')[0];
+  return ({'1h':'每小时','1d':'每天','1w':'每周','1mo':'每月'})[period] || r;
+}
+
+async function run(cmd) {
+  let res;
+  try {
+    res = await api('/api/cmd', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: cmd
+    });
+  } catch (e) {
+    toast('执行失败：' + e, true);
+    return false;
+  }
+  const verb = cmd.split(/\s+/)[0];
+  if (res.ok && (verb === 'remove' || verb === 'done')) {
+    toast(res.out, false, { label: '撤销', fn: () => run('undo') });
+  } else {
+    toast(res.out || '(无输出)', !res.ok);
+  }
+  load();
+  return res.ok === true;
+}
+
+function localInput(ms) {
+  const d = new Date(ms);
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+       + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function startNew() {
+  editing = null;
+  $('form').reset();
+  $('f_pri').value = '1';
+  $('f_hidden').checked = false;
+  $('editHint').hidden = true;
+  $('untilWrap').hidden = true;
+  $('f_until').value = '';
+  $('editor').hidden = false;
+  $('f_title').focus();
+}
+
+function startEdit(t) {
+  editing = t;
+  $('f_title').value = t.title;
+  $('f_due').value = t.due ? localInput(t.due) : '';
+  $('f_pri').value = String(t.priority || 1);
+  $('f_note').value = t.note || '';
+  $('f_hidden').checked = !!t.hidden;
+  $('f_rule').value = t.rule || '';
+  $('f_rule').disabled = true;           // 循环规则只支持新建时设定（引擎侧无 set -r）
+  $('untilWrap').hidden = true;
+  $('editHint').hidden = false;
+  $('editHint').textContent = '编辑中：' + t.title + '（循环规则不可在此修改）';
+  $('editor').hidden = false;
+  $('f_title').focus();
+}
+
+$('tabs').onclick = (e) => {
+  const b = e.target.closest('button[data-scope]');
+  if (!b) return;
+  scope = b.dataset.scope;
+  [...$('tabs').children].forEach(x => x.classList.toggle('on', x === b));
+  load();
+};
+
+$('refresh').onclick = () => { load(); toast('已刷新'); };
+$('newTask').onclick = startNew;
+$('cancel').onclick = () => { $('editor').hidden = true; $('f_rule').disabled = false; editing = null; };
+
+$('f_rule').onchange = () => { $('untilWrap').hidden = !$('f_rule').value; };
+
+document.querySelectorAll('[data-quick]').forEach(b => {
+  b.onclick = () => {
+    const now = new Date();
+    const at = (h, m) => new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
+    let v = null;
+    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 9, 0);
+    switch (b.dataset.quick) {
+      case 'today':    v = now.getTime() + 3600e3; break;
+      case 'tomorrow': v = dayStart.getTime(); break;
+      case 'dayafter': v = dayStart.getTime() + 86400e3; break;
+      case 'nextweek': v = dayStart.getTime() + 7 * 86400e3; break;
+      case 'clear':    $('f_due').value = ''; return;
+    }
+    $('f_due').value = localInput(v);
+  };
+});
+
+$('form').onsubmit = (e) => {
+  e.preventDefault();
+  const title = $('f_title').value.trim();
+  if (!title) { toast('标题不能为空', true); return; }
+  const due = $('f_due').value.trim();
+  const pri = $('f_pri').value;
+  const note = $('f_note').value.trim();
+  const hidden = $('f_hidden').checked;
+  const rule = $('f_rule').value;
+
+  let parts;
+  if (editing) {
+    parts = ['set', editing.title];
+    if (!due && editing.due) { toast('当前命令不支持清空时间，请保留原时间或设置新时间', true); return; }
+    if (!note && editing.note) { toast('当前命令不支持清空备注，请保留原备注或填写新备注', true); return; }
+    if (title !== editing.title) parts.push('-title', title);
+    if (due && due !== (editing.due ? localInput(editing.due) : '')) parts.push('-t', due);
+    if (String(pri) !== String(editing.priority)) parts.push('-p', pri);
+    if (hidden !== !!editing.hidden) parts.push(hidden ? '-hidden' : '-shown');
+    if (note !== (editing.note || '')) {
+      if (note) parts.push('-n', note);
+    }
+    if (parts.length === 2) { toast('没有改动'); return; }
+  } else {
+    parts = ['add', title];
+    if (due) parts.push('-t', due);
+    if (pri !== '1') parts.push('-p', pri);
+    if (rule) parts.push('-r', rule);
+    if (rule && $('f_until').value) parts.push('-until', $('f_until').value);
+    if (hidden) parts.push('-hidden');
+    if (note) parts.push('-n', note);      // -n 必须最后
+  }
+  const cmd = parts.join(' ');
+  run(cmd).then((ok) => {
+    if (!ok) return;
+    $('editor').hidden = true;
+    $('f_rule').disabled = false;
+    editing = null;
+  });
+};
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('editor').hidden) { $('cancel').click(); }
+  if (e.key === 'n' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); startNew(); }
+});
+
+$('f_title').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); $('save').click(); }
+});
+
+load();
+</script>
+</body>
+</html>

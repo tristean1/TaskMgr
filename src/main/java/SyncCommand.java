@@ -151,12 +151,14 @@ public final class SyncCommand {
 
             // 2) 把快照装到目标端（备份 + 替换 + 校验都在那边做，逻辑只有一份）
             System.out.println("[同步] 写入 " + dst.name() + "（源 " + srcDb.tasks() + " 条任务）…");
-            install(dst, srcSnap, work);
-
-            // 3) 恢复目标端守护进程
-            if (wasRunning) {
-                System.out.println("[同步] 重新启动 " + dst.name() + " 的守护进程…");
-                dst.start();
+            try {
+                install(dst, srcSnap, work);
+            } finally {
+                // 安装失败也恢复原来运行的服务；安装器已保证校验失败不覆盖旧库。
+                if (wasRunning) {
+                    System.out.println("[同步] 重新启动 " + dst.name() + " 的守护进程…");
+                    dst.start();
+                }
             }
             System.out.println("[同步] 完成。" + src.name() + " -> " + dst.name()
                     + " ｜ tasks " + srcDb.tasks() + " · op_log " + srcDb.opLog()
@@ -322,20 +324,39 @@ public final class SyncCommand {
         }
         if (!Files.exists(snapshot)) throw new IOException("找不到快照：" + snapshot);
         Path db = DaemonEndpoint.dbPath();
+        if (Files.exists(db) && Files.isSameFile(snapshot, db)) throw new IOException("快照不能是目标数据库本身");
         Files.createDirectories(db.getParent());
-        String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
-        if (Files.exists(db)) {
-            Path bak = db.resolveSibling("tasks.db.bak-" + stamp);
-            Files.move(db, bak, StandardCopyOption.REPLACE_EXISTING);
-            System.out.println("[同步] 旧库已留档：" + bak.getFileName());
+        // 先验证独立暂存副本；损坏快照/复制失败时不能触碰原库。
+        Path staged = Files.createTempFile(db.getParent(), "sync-install-", ".db");
+        try {
+            Db source = read(snapshot);
+            Files.copy(snapshot, staged, StandardCopyOption.REPLACE_EXISTING);
+            Db installed = read(staged);
+            if (!source.equals(installed)) throw new IOException("快照复制前后内容不一致，已中止");
+            if (Files.exists(db)) {
+                String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+                Path bak = db.resolveSibling("tasks.db.bak-" + stamp + "-" + java.util.UUID.randomUUID());
+                // 崩溃残留 WAL 也必须纳入备份，不能只搬走主文件然后删 WAL。
+                try (Connection old = DriverManager.getConnection("jdbc:sqlite:" + db);
+                     Statement st = old.createStatement()) {
+                    try (ResultSet rs = st.executeQuery("PRAGMA wal_checkpoint(TRUNCATE)")) {
+                        if (rs.next() && rs.getInt(1) != 0) throw new IOException("旧库仍被占用，拒绝替换");
+                    }
+                    st.execute("VACUUM INTO '" + bak.toAbsolutePath().toString().replace("'", "''") + "'");
+                }
+                read(bak);
+                System.out.println("[同步] 旧库已留档：" + bak.getFileName());
+            }
+            if (DaemonEndpoint.isRunning()) throw new IOException("守护进程已重新启动，拒绝换库");
+            Files.deleteIfExists(db.resolveSibling("tasks.db-wal"));
+            Files.deleteIfExists(db.resolveSibling("tasks.db-shm"));
+            // 不支持原子替换的文件系统直接失败，保持旧库可用。
+            Files.move(staged, db, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            System.out.println("[同步] 已写入并校验：" + db);
+            System.out.print(installed.describe("   "));
+        } finally {
+            Files.deleteIfExists(staged);
         }
-        Files.deleteIfExists(db.resolveSibling("tasks.db-wal"));
-        Files.deleteIfExists(db.resolveSibling("tasks.db-shm"));
-        Files.copy(snapshot, db, StandardCopyOption.REPLACE_EXISTING);
-
-        Db installed = read(db);
-        System.out.println("[同步] 已写入并校验：" + db);
-        System.out.print(installed.describe("   "));
     }
 
     // ------------------------------------------------------------------ 读库比对
@@ -425,7 +446,7 @@ public final class SyncCommand {
         ProcessBuilder pb = new ProcessBuilder("ssh", host, command);
         pb.redirectErrorStream(true);
         Process p = pb.start();
-        String out = drain(p.getInputStream());
+        String out = awaitOutput(p, 180_000L);
         if (!p.waitFor(180, TimeUnit.SECONDS)) {
             p.destroyForcibly();
             throw new IOException("远端命令超时：" + command);
@@ -442,7 +463,7 @@ public final class SyncCommand {
         ProcessBuilder pb = new ProcessBuilder("ssh", host, command);
         pb.redirectErrorStream(true);
         Process p = pb.start();
-        String out = drain(p.getInputStream());
+        String out = awaitOutput(p, 180_000L);
         if (!p.waitFor(180, TimeUnit.SECONDS)) {
             p.destroyForcibly();
             throw new IOException("远端命令超时：" + command);
@@ -455,7 +476,7 @@ public final class SyncCommand {
             ProcessBuilder pb = new ProcessBuilder("ssh", host, command);
             pb.redirectErrorStream(true);
             Process p = pb.start();
-            drain(p.getInputStream());
+            awaitOutput(p, 30_000L);
             p.waitFor(30, TimeUnit.SECONDS);
         } catch (Exception ignored) {
         }
@@ -473,7 +494,7 @@ public final class SyncCommand {
         ProcessBuilder pb = new ProcessBuilder(args);
         pb.redirectErrorStream(true);
         Process p = pb.start();
-        String out = drain(p.getInputStream());
+        String out = awaitOutput(p, 180_000L);
         if (!p.waitFor(180, TimeUnit.SECONDS)) {
             p.destroyForcibly();
             throw new IOException("命令超时：" + String.join(" ", args));
@@ -486,6 +507,25 @@ public final class SyncCommand {
 
     private static String drain(InputStream in) throws IOException {
         return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+    }
+
+    /** 同时排空输出与计时；不能先 readAllBytes 再 waitFor（前者可能永远不返回）。 */
+    static String awaitOutput(Process process, long timeoutMillis) throws Exception {
+        var reader = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "sync-process-output"); t.setDaemon(true); return t;
+        });
+        var output = reader.submit(() -> drain(process.getInputStream()));
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        try {
+            if (!process.waitFor(timeoutMillis, TimeUnit.MILLISECONDS)) throw new java.util.concurrent.TimeoutException();
+            return output.get(Math.max(1, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            throw new IOException("同步子进程超时，已终止", e);
+        } finally {
+            if (process.isAlive()) process.destroyForcibly();
+            output.cancel(true);
+            reader.shutdownNow();
+        }
     }
 
     private static void deleteQuietly(Path dir) {

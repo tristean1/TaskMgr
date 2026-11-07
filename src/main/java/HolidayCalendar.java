@@ -59,6 +59,7 @@ public final class HolidayCalendar {
     private final Consumer<String> log;
     /** date → 是否放假。只装已经拿到数据的年份。 */
     private final Map<LocalDate, Boolean> days = new HashMap<>();
+    private final java.util.Set<Integer> cacheChecked = new java.util.HashSet<>();
 
     public HolidayCalendar(Path dir, Consumer<String> log) {
         this.dir = dir;
@@ -77,6 +78,7 @@ public final class HolidayCalendar {
      * <p>优先级：手工例外 &gt; 网上数据 &gt; 周六周日。
      */
     public boolean isDayOff(LocalDate date) {
+        if (cacheChecked.add(date.getYear())) loadCachedYear(date.getYear());
         Boolean manual = manualOverride(date);
         if (manual != null) return manual;
         Boolean known = days.get(date);
@@ -124,7 +126,6 @@ public final class HolidayCalendar {
      * @return 是否有任何一个年份的数据可用
      */
     public boolean syncIfNeeded(LocalDate today) {
-        if (!autoSync) return false;   // 测试/离线：不联网，直接用缓存或周末规则
         boolean ok = ensureYear(today.getYear());
         // 12 月就得知道明年元旦放哪几天，否则跨年那几天会按周末猜错
         if (today.getMonthValue() >= 11) ok = ensureYear(today.getYear() + 1) || ok;
@@ -142,6 +143,11 @@ public final class HolidayCalendar {
      * @return 该年是否有可用数据
      */
     public boolean ensureYear(int year) {
+        if (loadCachedYear(year)) return true;
+        return autoSync && download(year);
+    }
+
+    private boolean loadCachedYear(int year) {
         Path file = dir.resolve(year + ".json");
         if (Files.isRegularFile(file)) {
             try {
@@ -152,7 +158,7 @@ public final class HolidayCalendar {
                 log.accept("[节假日] 读缓存失败：" + e.getMessage());
             }
         }
-        return download(year);
+        return false;
     }
 
     /** 联网拉取某一年并写入缓存。全部源失败返回 false（不抛异常）。 */

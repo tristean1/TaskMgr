@@ -293,12 +293,12 @@ public class TaskEngine {
                         i = consumeTimeTokens(argv, i); hasSharedA = true;
                         break;
                     case "-r":
-                        // REQ-018：-r 1d / 1w / 1mo（隐含 -g recurring）
-                        if (i + 1 >= argv.length) { out.accept("[错误] -r 需要周期：1d / 1w / 1mo"); return; }
+                        // REQ-018：-r 1h / 1d / 1w / 1mo（隐含 -g recurring）
+                        if (i + 1 >= argv.length) { out.accept("[错误] -r 需要周期：1h / 1d / 1w / 1mo"); return; }
                         recPeriod = argv[++i].toLowerCase();
                         if (!Recurrence.isValidPeriod(recPeriod)) {
                             out.accept("[错误] 不支持的循环周期：" + recPeriod
-                                    + "\n        可用：1d（每天）｜1w（每周）｜1mo（每月）");
+                                    + "\n        可用：1h（每小时）｜1d（每天）｜1w（每周）｜1mo（每月）");
                             return;
                         }
                         triggerType = "recurring";
@@ -586,7 +586,7 @@ public class TaskEngine {
             sb.append("\n     [循环] ").append(Recurrence.describe(recurrenceRule))
               .append(" · 首次 ").append(fmtEpoch(triggerAt))
               .append(Recurrence.untilOf(recurrenceRule) == null
-                      ? "（之后一直重复，直到 remove 或 done 后次日复活）"
+                      ? "（remove 终止；done 后按周期恢复，回执显示下次触发）"
                       : "（到期后不再重复）");
         }
         if (hidden) {   // REQ-022：隐藏任务必须说明「什么时候才会自己浮出来」，否则像加了条空气
@@ -759,12 +759,12 @@ public class TaskEngine {
      * （备份、同步、`undo` 的边界都因此不动）。
      */
     public String metaValue(String key) throws SQLException {
-        return metaGet(key);
+        synchronized (conn) { return metaGet(key); }
     }
 
     /** 见 {@link #metaValue(String)}。 */
     public void metaSet(String key, String value) throws SQLException {
-        metaPut(key, value);
+        synchronized (conn) { metaPut(key, value); }
     }
 
     /**
@@ -776,6 +776,10 @@ public class TaskEngine {
      * <p>QQ 是窄屏，一行一条、不换行折行；标题过长由客户端负责截断。
      */
     public String buildGreeting() {
+        synchronized (conn) { return buildGreetingLocked(); }
+    }
+
+    private String buildGreetingLocked() {
         ZoneId zone = clock.getZone();
         LocalDate today = LocalDate.now(clock);
         long startOfDay = today.atStartOfDay(zone).toInstant().toEpochMilli();
@@ -1037,11 +1041,19 @@ public class TaskEngine {
             if (com.google.gson.JsonParser.parseString(beforeJson).getAsJsonObject().has("error") || "{}".equals(beforeJson)) throw new SQLException("无法读取操作前快照");
             // REQ-018：循环任务完成时记下「次日 00:00 复活」；removed 不写（系列即结束）
             String recRule = null;
-            try (PreparedStatement ps = conn.prepareStatement("SELECT recurrence_rule FROM tasks WHERE id=?")) {
+            Long recTrigger = null;
+            try (PreparedStatement ps = conn.prepareStatement("SELECT recurrence_rule, trigger_at FROM tasks WHERE id=?")) {
                 ps.setString(1, id);
-                try (ResultSet rs = ps.executeQuery()) { if (rs.next()) recRule = rs.getString(1); }
+                try (ResultSet rs = ps.executeQuery()) { if (rs.next()) {
+                    recRule = rs.getString(1);
+                    long trigger = rs.getLong(2);
+                    recTrigger = rs.wasNull() ? null : trigger;
+                } }
             }
-            Long reviveAt = "done".equals(newStatus) ? Recurrence.reviveStampFor(recRule, now) : null;
+            Long nextTrigger = "done".equals(newStatus)
+                    ? Recurrence.nextOnCompletion(recRule, recTrigger, now, clock.getZone()) : null;
+            Long reviveAt = nextTrigger == null ? null : Recurrence.HOURLY.equals(Recurrence.periodOf(recRule))
+                    ? nextTrigger : Recurrence.reviveAt(now, clock.getZone());
             String u = "UPDATE tasks SET status=?, done_at=?, updated_at=?, next_trigger_at=? "
                     + "WHERE id=? AND status='todo'";
             try (PreparedStatement ps = conn.prepareStatement(u)) {
@@ -1057,6 +1069,11 @@ public class TaskEngine {
             if (com.google.gson.JsonParser.parseString(afterJson).getAsJsonObject().has("error") || "{}".equals(afterJson)) throw new SQLException("无法读取操作后快照");
             opLog.recordStatusChangeStrict(id, newStatus, beforeJson, afterJson);
             String result = "[OK] 任务已设为 " + newStatus + ": \"" + title + "\"";
+            if ("done".equals(newStatus) && Recurrence.isRecurring(recRule)) {
+                result += nextTrigger == null ? "\n[循环] 已到截止时间，无下次触发。"
+                        : "\n[循环] 下次触发：" + DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+                            .withZone(clock.getZone()).format(Instant.ofEpochMilli(nextTrigger));
+            }
             if (active != null && (targetTimer || id.equals(active.taskId())))
                 return result + "\n" + workTimer.close(active, now, "done".equals(newStatus) ? "done" : "remove");
             return result + stillRunning(active);
@@ -1721,16 +1738,21 @@ public class TaskEngine {
         // BUG-023：原实现只读 argv[0]，list done extra 会静默忽略多余参数。
         // REQ-022：`-a` = 连隐藏任务一起显示（对齐 `ls -a`），可与状态参数任意组合。
         boolean showHidden = false;
+        boolean json = false;
         List<String> positional = new ArrayList<>();
         for (String a : argv) {
             if (a == null || a.isEmpty()) continue;
+            if ("-json".equals(a) || "--json".equals(a)) {
+                json = true;
+                continue;
+            }
             if ("-a".equals(a) || "--all-hidden".equals(a)) {
                 showHidden = true;
                 continue;
             }
             if (a.startsWith("-")) {
                 out.accept("[提示] 未知的 list 开关：" + a
-                        + "\n        用法：list ｜ list todo|done|removed|all ｜ 后面可加 -a 连隐藏任务一起看");
+                        + "\n        用法：list ｜ list todo|done|removed|all ｜ 后面可加 -a 连隐藏任务一起看 ｜ -json 输出 JSON");
                 return;
             }
             positional.add(a);
@@ -1756,6 +1778,7 @@ public class TaskEngine {
                 "COALESCE(trigger_at, remind_at) AS due_ms " +
                 "FROM tasks WHERE " + where + " ORDER BY created_at ASC";
         int n = 0;
+        com.google.gson.JsonArray jsonRows = json ? new com.google.gson.JsonArray() : null;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             WorkTimer.Session active = workTimer.current();
             if (!all) ps.setString(1, status);
@@ -1778,6 +1801,24 @@ public class TaskEngine {
                       .append(" (").append(type).append(")");
                     if (!due.isEmpty()) sb.append(" DDL ").append(due);
                     String rec = rs.getString("recurrence_rule");
+                    if (jsonRows != null) {
+                        // REQ-023：网页要的是结构化数据，不是给人看的文本。
+                        com.google.gson.JsonObject o = new com.google.gson.JsonObject();
+                        o.addProperty("id", rs.getString("id"));
+                        o.addProperty("title", title);
+                        o.addProperty("note", note == null ? "" : note);
+                        o.addProperty("status", st);
+                        o.addProperty("priority", priority);
+                        o.addProperty("type", type);
+                        Object dueMsObj = rs.getObject("due_ms");
+                        if (dueMsObj == null) o.add("due", com.google.gson.JsonNull.INSTANCE);
+                        else o.addProperty("due", ((Number) dueMsObj).longValue());
+                        o.addProperty("dueText", due);
+                        o.addProperty("rule", rec == null ? "" : rec);
+                        o.addProperty("hidden", hid);
+                        o.addProperty("working", active != null && rs.getString("id").equals(active.taskId()));
+                        jsonRows.add(o);
+                    }
                     if (Recurrence.isRecurring(rec)) sb.append("  [循环] ").append(Recurrence.describe(rec));
                     if (hid) sb.append("  [隐藏]");
                     sb.append("  ").append(title);
@@ -1794,7 +1835,7 @@ public class TaskEngine {
                     }
                 }
                 if (active != null && active.taskId() == null) sb.append("\n活动（非任务）：").append(workTimer.describe(active));
-                out.accept(sb.toString());
+                out.accept(jsonRows != null ? jsonRows.toString() : sb.toString());
             }
         } catch (SQLException e) {
             out.accept("[错误] list 失败: " + e.getMessage());
@@ -1871,8 +1912,10 @@ public class TaskEngine {
         out.accept("用法：\n"
             + "  add <标题> [-p 优先级1-9] [-g once|recurring|ongoing] [-t 触发时刻] [-a 提醒时刻] [-n 备注] [-hidden]\n"
             + "      注意：-n 必须放在最后，其后所有内容都会作为备注；未知开关（如 -x）会直接报错\n"
-            + "      循环：-r 1d|1w|1mo 需配 -t（-t 的时分秒＝每次几点），-until 截止时刻，例：\n"
+            + "      循环：-r 1h|1d|1w|1mo 需配 -t（-t 的时分秒＝每次几点），-until 截止时刻，例：\n"
             + "        add 每天晚上提醒 -r 1d -t year2026 month11 day1 time21:00\n"
+            + "        add 喝水 -r 1h -t T+1h（固定整小时间隔；done 后下次触发时恢复待办）\n"
+            + "      循环任务 done 回执显示下次触发；日/周/月仍次日恢复待办，remove 终止循环\n"
             + "      隐藏：-hidden 平时不出现在 list/next 里，只在它触发的那天冒出来（课表就用这个）\n"
             + "  list | ls          —— 列出待办任务（TODO，默认）\n"
             + "  list done|removed|all  —— 列出 已完成 / 已移除 / 全部（TODO+DONE）\n"
@@ -1958,6 +2001,36 @@ public class TaskEngine {
     }
 
     /**
+     * REQ-023：绝对时刻写法。支持
+     * <ul>
+     *   <li>{@code 2026-11-09T08:00}（网页 datetime-local 的原样输出）</li>
+     *   <li>{@code 2026-11-09 08:00} / {@code 2026-11-09T08:00:30}</li>
+     *   <li>{@code 2026-11-09}（当天 00:00）</li>
+     * </ul>
+     * 只认「四位年-月-日」这个明确形状；解析失败返回 null，交回词序列老路径。
+     * 时区取注入 {@link Clock} 的时区，测试里可固定。
+     */
+    private Long parseAbsoluteDateTime(String s) {
+        if (s == null) return null;
+        String v = s.trim().replace('T', ' ').replace('/', '-').replaceAll("\\s+", " ");
+        if (!v.matches("\\d{4}-\\d{1,2}-\\d{1,2}( \\d{1,2}:\\d{2}(:\\d{2})?)?")) return null;
+        ZoneId zone = clock.getZone();
+        try {
+            String[] half = v.split(" ");
+            LocalDate d = LocalDate.parse(half[0]);
+            if (half.length == 1) {
+                return d.atStartOfDay(zone).toInstant().toEpochMilli();
+            }
+            String[] hms = half[1].split(":");
+            LocalTime t = LocalTime.of(Integer.parseInt(hms[0]), Integer.parseInt(hms[1]),
+                    hms.length > 2 ? Integer.parseInt(hms[2]) : 0);
+            return LocalDateTime.of(d, t).atZone(zone).toInstant().toEpochMilli();
+        } catch (Exception e) {
+            return null;   // 形状对但日期非法（如 2026-02-31），按解析失败处理
+        }
+    }
+
+    /**
      * 解析 -t/-a 的时间表达式。
      * <p>BUG-013（2026-10-21 修复）：绝对日期的缺省组件改为「取当前年/月/日」，与 help 文案一致。
      * 原实现缺月补 1、缺日补 1 ⇒ `-t day20 time20:14` 会被解析成 1 月 20 日（过去时间，永不提醒）。
@@ -1965,6 +2038,10 @@ public class TaskEngine {
      * <p>本方法依赖注入的 {@link Clock}，因此测试可用固定时钟验证「现在」。
      */
     private Long parseTimeStrict(String s) {
+        // REQ-023：网页的 <input type="datetime-local"> 产出 2026-11-09T08:00，
+        // 让 -t 直接吃这种绝对时刻，前端不必反推 month11 day9 time08:00 的词序列。
+        Long absolute = parseAbsoluteDateTime(s);
+        if (absolute != null) return absolute;
         String inc = s.startsWith("T") ? s.substring(1) : s;
         if (looksLikeIncrement(inc)) {
             return Instant.now(clock).plusMillis(parseIncrementMillis(inc)).toEpochMilli();

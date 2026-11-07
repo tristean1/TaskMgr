@@ -86,6 +86,18 @@ public class Daemon {
     /** REQ-021：节假日日历 + 每日问候。 */
     private HolidayCalendar holidays;
     private GreetingService greeting;
+    private WebServer web;
+
+    /**
+     * REQ-023：引擎的全局串行锁。
+     *
+     * <p>网页加了 HTTP 线程池之后，命令不再只来自"一个连接一个线程"的 UDS 入口：
+     * 浏览器一边轮询 {@code list}、用户一边点提交 {@code add}，两条线程会同时用**同一条**
+     * SQLite {@link Connection}。写命令本来就靠 {@code SqlTransaction} 里的
+     * {@code synchronized (conn)} 互斥，但**读命令不走那把锁** —— 一旦落在别人开着事务的连接上，
+     * 读到的东西会被卷进别人的事务边界。所以在这里对「执行一条命令」整体加锁。
+     */
+    private final Object engineLock = new Object();
 
     public static void main(String[] args) throws Exception {
         Thread.setDefaultUncaughtExceptionHandler((t, e) ->
@@ -230,10 +242,12 @@ public class Daemon {
         event("[daemon] 本地弹窗：" + (LocalAlert.enabled()
                 ? "开启" : "关闭（无桌面环境，或 " + AppSettings.FILE_NAME + " 中的 "
                         + LocalAlert.KEY_POPUP + "=0）"));
-        reminder.start(0, REMIND_INTERVAL_MS);
 
         // 第 2 期：QQ 机器人懒托管。这里只建壳，真正连网要等 task qqbot up。
         qqbotHost = new QqBotHost(String.valueOf(DaemonEndpoint.dbPath()), this::event);
+        // 云端 QQ 尚在登录时不能把到期任务当作已成功送达。
+        refreshReminderPush();
+        reminder.start(0, REMIND_INTERVAL_MS);
 
         // REQ-021：每日问候。只在有发送通道（QQ 在线）时才发；错过则重试到 12:00。
         holidays = HolidayCalendar.atHome(this::eventAndLog);
@@ -262,6 +276,19 @@ public class Daemon {
                 DaemonEndpoint.PROTOCOL));
 
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "daemon-shutdown"));
+
+        // REQ-023：网页界面与守护进程跑在一起（用户 2026-11-07 拍板"放一起"）。
+        // 只绑 127.0.0.1 —— 服务器有公网 IP，绝不监听 0.0.0.0；本机靠 ssh -L 隧道进来。
+        if (WebServer.enabled()) {
+            try {
+                web = WebServer.start(cmd -> exec(cmd, "web"));
+                eventAndLog("[网页] 已启动 http://127.0.0.1:" + WebServer.port() + "/（只绑本机回环，需 ssh -L 隧道访问）");
+            } catch (Throwable e) {
+                eventAndLog("[网页] 启动失败（不影响其余功能）：" + describe(e));
+            }
+        } else {
+            eventAndLog("[网页] 已关闭（web.enabled=0）");
+        }
         say("[守护进程] 已启动 pid=" + ProcessHandle.current().pid()
                 + " socket=" + DaemonEndpoint.socketPath());
 
@@ -314,6 +341,19 @@ public class Daemon {
         server.configureBlocking(true);
     }
 
+    /**
+     * 执行一条命令的**唯一入口**：UDS 客户端与网页都走这里，因此天然串行（见 {@link #engineLock}）。
+     *
+     * @param source "cli" 或 "web"，只用于日志与将来的审计，不影响语义
+     */
+    String exec(String cmd, String source) {
+        String lower = cmd == null ? "" : cmd.toLowerCase();
+        boolean isQqbot = lower.equals("qqbot") || lower.startsWith("qqbot ");
+        synchronized (engineLock) {
+            return isQqbot ? qqbotCommand(cmd) : engine.executeFor(cmd, source);
+        }
+    }
+
     private void acceptLoop() {
         say("[守护进程] 等待客户端连接…");
         while (running) {
@@ -346,14 +386,19 @@ public class Daemon {
     private String qqbotCommand(String cmd) {
         String reply = qqbotHost.execute(cmd);
         boolean up = qqbotHost.isUp();
+        refreshReminderPush();
+        log("[QQBot] 命令 " + abbreviate(cmd) + " → " + (up ? "已开启" : "已关闭"));
+        return reply;
+    }
+
+    private void refreshReminderPush() {
+        boolean up = qqbotHost.isUp();
         // 三元里放方法引用推断不出目标类型（void 无法转 Boolean），必须写成两句。
-        if (up) {
-            reminder.setOnTaskRemind(qqbotHost::pushRemind);
+        if (up || AppSettings.getBool("qqbot.autostart", false)) {
+            reminder.setOnTaskRemind(text -> qqbotHost.isUp() && qqbotHost.pushRemind(text));
         } else {
             reminder.setOnTaskRemind(null);
         }
-        log("[QQBot] 命令 " + abbreviate(cmd) + " → " + (up ? "已开启" : "已关闭"));
-        return reply;
     }
 
     /** 广播一条事件给所有已连接客户端（没有人连着时只是丢弃——文件日志里仍有记录）。 */
@@ -408,6 +453,10 @@ public class Daemon {
         if (icsTimer != null) icsTimer.shutdownNow();
         try {
             if (greeting != null) greeting.close();
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (web != null) web.stop();
         } catch (Throwable ignored) {
         }
         try {
@@ -492,10 +541,8 @@ public class Daemon {
                 default -> {
                     String reply;
                     long t0 = System.currentTimeMillis();
-                    String lower = cmd.toLowerCase();
-                    boolean isQqbot = lower.equals("qqbot") || lower.startsWith("qqbot ");
                     try {
-                        reply = isQqbot ? qqbotCommand(cmd) : engine.executeFor(cmd, "cli");
+                        reply = exec(cmd, "cli");
                     } catch (Throwable t) {
                         reply = "[错误] 命令执行失败：" + describe(t);
                     }

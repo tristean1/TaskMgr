@@ -22,7 +22,7 @@ public class QqBotHost {
     private final String dbPath;
     private final Consumer<String> sink;
 
-    private QqBot qqBot;
+    private volatile QqBot qqBot;
     private Connection qqConn;
     private SingleInstanceLock lock;
 

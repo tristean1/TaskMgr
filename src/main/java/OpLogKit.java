@@ -138,7 +138,7 @@ public class OpLogKit {
                 String taskId;
                 String beforeJson;
                 String sql = "SELECT id, op_type, task_id, before_json FROM op_log "
-                        + "WHERE undone = 0 ORDER BY created_at DESC LIMIT 1";
+                        + "WHERE undone = 0 ORDER BY created_at DESC, rowid DESC LIMIT 1";
                 try (PreparedStatement ps = conn.prepareStatement(sql);
                      ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) return null;

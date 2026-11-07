@@ -39,6 +39,7 @@ import java.util.List;
 public final class Recurrence {
 
     public static final String DAILY = "1d";
+    public static final String HOURLY = "1h";
     public static final String WEEKLY = "1w";
     public static final String MONTHLY = "1mo";
 
@@ -57,7 +58,7 @@ public final class Recurrence {
 
     /** 周期写法是否合法（供 add 校验用）。 */
     public static boolean isValidPeriod(String period) {
-        return DAILY.equals(period) || WEEKLY.equals(period) || MONTHLY.equals(period);
+        return HOURLY.equals(period) || DAILY.equals(period) || WEEKLY.equals(period) || MONTHLY.equals(period);
     }
 
     /**
@@ -116,7 +117,8 @@ public final class Recurrence {
         String period = periodOf(rule);
         if (period == null) return "";
         StringBuilder sb = new StringBuilder();
-        if (DAILY.equals(period)) sb.append("每天");
+        if (HOURLY.equals(period)) sb.append("每小时");
+        else if (DAILY.equals(period)) sb.append("每天");
         else if (WEEKLY.equals(period)) sb.append("每周");
         else {
             Integer dom = domOf(rule);
@@ -140,9 +142,19 @@ public final class Recurrence {
      * @return 下一次的时刻；{@code null} 表示序列已结束（越过 {@code until} 或规则非法）
      */
     public static Long nextAfter(long triggerAt, String rule, long now) {
+        return nextAfter(triggerAt, rule, now, ZoneId.systemDefault());
+    }
+
+    public static Long nextAfter(long triggerAt, String rule, long now, ZoneId zone) {
         String period = periodOf(rule);
         if (period == null) return null;
-        ZoneId zone = ZoneId.systemDefault();
+        if (HOURLY.equals(period)) {
+            long step = 3_600_000L;
+            long count = now < triggerAt ? 1 : Math.addExact(Math.floorDiv(Math.subtractExact(now, triggerAt), step), 1);
+            long next = Math.addExact(triggerAt, Math.multiplyExact(count, step));
+            Long until = untilOf(rule);
+            return until != null && next > until ? null : next;
+        }
         ZonedDateTime base = Instant.ofEpochMilli(triggerAt).atZone(zone);
         Long until = untilOf(rule);
 
@@ -173,7 +185,10 @@ public final class Recurrence {
 
     /** 复活时刻：次日 00:00（本地时区）。 */
     public static long reviveAt(long now) {
-        ZoneId zone = ZoneId.systemDefault();
+        return reviveAt(now, ZoneId.systemDefault());
+    }
+
+    static long reviveAt(long now, ZoneId zone) {
         LocalDate tomorrow = Instant.ofEpochMilli(now).atZone(zone).toLocalDate().plusDays(1);
         return LocalDateTime.of(tomorrow, java.time.LocalTime.MIDNIGHT).atZone(zone).toInstant().toEpochMilli();
     }
@@ -192,7 +207,7 @@ public final class Recurrence {
         List<String> ids = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(
                 "SELECT id FROM tasks WHERE status='todo' AND last_notified_at IS NOT NULL "
-                        + "AND trigger_at IS NOT NULL AND trigger_at<=? "
+                        + "AND trigger_at IS NOT NULL AND trigger_at<=? AND trigger_at>last_notified_at "
                         + "AND recurrence_rule IS NOT NULL AND recurrence_rule<>''")) {
             ps.setLong(1, now);
             try (ResultSet rs = ps.executeQuery()) {
@@ -204,7 +219,7 @@ public final class Recurrence {
             try (PreparedStatement ps = conn.prepareStatement(
                     "UPDATE tasks SET last_notified_at=NULL "
                             + "WHERE id=? AND status='todo' AND last_notified_at IS NOT NULL "
-                            + "AND trigger_at IS NOT NULL AND trigger_at<=?")) {
+                            + "AND trigger_at IS NOT NULL AND trigger_at<=? AND trigger_at>last_notified_at")) {
                 ps.setString(1, id);
                 ps.setLong(2, now);
                 n += ps.executeUpdate();
@@ -224,12 +239,12 @@ public final class Recurrence {
     public static int reviveDue(Connection conn, long now) throws SQLException {
         List<String[]> rows = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT id, trigger_at, recurrence_rule FROM tasks "
+                "SELECT id, trigger_at, recurrence_rule, next_trigger_at FROM tasks "
                         + "WHERE status='done' AND next_trigger_at IS NOT NULL AND next_trigger_at<=?")) {
             ps.setLong(1, now);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    rows.add(new String[]{rs.getString(1), rs.getString(2), rs.getString(3)});
+                    rows.add(new String[]{rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4)});
                 }
             }
         }
@@ -241,11 +256,16 @@ public final class Recurrence {
             // 若下一次的时刻本来就还在未来（提前完成的情况），保持不动；
             // 只有已经过期才往前推 —— 否则会把「明天该响的」白推进一天。
             Long next;
-            if (triggerAt != null && triggerAt > now) {
+            if (HOURLY.equals(periodOf(rule))) {
+                // 完成时已计算好下一轮；迟到扫描仍应补发，不能再推进一小时。
+                next = Long.valueOf(row[3]);
+            } else if (triggerAt != null && triggerAt >= Long.parseLong(row[3])) {
                 next = triggerAt;
             } else {
-                next = triggerAt == null ? null : nextAfter(triggerAt, rule, now);
+                next = triggerAt == null ? null : nextAfter(triggerAt, rule, Long.parseLong(row[3]) - 1);
             }
+            Long until = untilOf(rule);
+            if (until != null && now > until) next = null;
             if (next == null) {
                 // 序列已结束：停在已完成状态，别再每天重试
                 try (PreparedStatement ps = conn.prepareStatement(
@@ -302,6 +322,15 @@ public final class Recurrence {
     /** 已完成的循环任务写「次日 00:00 复活」；非循环返回 null（调用方写 NULL）。 */
     public static Long reviveStampFor(String rule, long now) {
         return isRecurring(rule) ? Long.valueOf(reviveAt(now)) : null;
+    }
+
+    /** 完成回执与复活共用的下一次触发计算，保留首次触发的固定节奏。 */
+    public static Long nextOnCompletion(String rule, Long triggerAt, long now, ZoneId zone) {
+        if (!isRecurring(rule) || triggerAt == null) return null;
+        long threshold = HOURLY.equals(periodOf(rule)) ? now : reviveAt(now, zone) - 1;
+        Long until = untilOf(rule);
+        Long next = triggerAt > threshold ? triggerAt : nextAfter(triggerAt, rule, threshold, zone);
+        return next == null || (until != null && next > until) ? null : next;
     }
 
     private static String fmtDate(long ms) {

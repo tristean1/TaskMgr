@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *   task up             启动守护进程（幂等）
  *   task down           优雅停止守护进程
  *   task status         守护进程状态
+ *   task web            打开网页界面（REQ-023）
  * </pre>
  *
  * <p><b>为什么命令文本从句环境变量 {@code TASKCMDLINE} 读，而不是 argv</b>：
@@ -83,6 +84,7 @@ public class TaskClient {
                 int rc = SyncCommand.run(cmdLine.split("\\s+"));
                 if (rc != 0) System.exit(rc);
             }
+            case "web" -> web();
             case "__snapshot" -> internalSnapshot(cmdLine);
             case "__install" -> internalInstall(cmdLine);
             case "help", "?", "--help" -> usage();
@@ -93,6 +95,51 @@ public class TaskClient {
     }
 
     // ---------------------------------------------------------------- 子命令
+
+    /**
+     * REQ-023：打开网页界面。
+     *
+     * <p>网页服务跑在守护进程里，并且**只绑 127.0.0.1**（服务器有公网 IP，绝不监听 0.0.0.0）。
+     * 所以本机要访问服务器上的页面，必须有一条 ssh 端口转发。设置项 {@code web.tunnel=<ssh 别名>}
+     * 一配，{@code task web} 就会顺手把隧道开起来再打开浏览器。
+     */
+    private static void web() {
+        int port = AppSettings.getInt("web.port", 8080);
+        String url = "http://127.0.0.1:" + port + "/";
+        String host = AppSettings.get("web.tunnel", "").trim();
+        if (!host.isEmpty()) {
+            try {
+                new ProcessBuilder("ssh", "-N", "-L", port + ":127.0.0.1:" + port, host)
+                        .redirectErrorStream(true)
+                        .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                        .start();
+                Thread.sleep(900);          // 等隧道建立，否则浏览器先到会打不开
+                System.out.println("[网页] 已开隧道 " + host + " → " + url);
+            } catch (Exception e) {
+                System.out.println("[提示] 开隧道失败：" + e);
+            }
+        } else if (running()) {
+            System.out.println("[网页] 守护进程在本机，直接访问 " + url);
+        } else {
+            System.out.println("[提示] 没配 web.tunnel，本机也没有正在跑的守护进程。");
+            System.out.println("       ① 在 " + AppSettings.path() + " 里写 web.tunnel=<ssh 主机别名>，或");
+            System.out.println("       ② 手动开隧道：ssh -N -L " + port + ":127.0.0.1:" + port + " <主机>");
+            return;
+        }
+        openBrowser(url);
+    }
+
+    private static void openBrowser(String url) {
+        try {
+            if (java.awt.Desktop.isDesktopSupported()
+                    && java.awt.Desktop.getDesktop().isSupported(java.awt.Desktop.Action.BROWSE)) {
+                java.awt.Desktop.getDesktop().browse(java.net.URI.create(url));
+                return;
+            }
+        } catch (Throwable ignored) {
+        }
+        System.out.println("[提示] 打不开浏览器，请手动访问 " + url);
+    }
 
     /** 启动守护进程（幂等）：已在跑就报状态。用 javaw 拉，脱离控制台，关窗口不死。 */
     private static void up() throws Exception {
@@ -440,6 +487,8 @@ public class TaskClient {
                   task sync <源>-><目标> [--dry]
                                        整库搬运（v1 为方向覆盖；--dry 只比对不改动）
                                        节点名写在 ~/.taskmgr/nodes.properties
+                  task web             打开网页界面（网页跑在守护进程里，只绑 127.0.0.1）
+                                       需要 web.tunnel=<ssh 别名> 才能从本机连到服务器
                 """);
     }
 

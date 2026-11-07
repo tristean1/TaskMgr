@@ -85,6 +85,20 @@ public final class AppSettings {
     }
 
     /**
+     * 取整数；不是数字或越界（&lt; min 或 &gt; 65535 对端口无意义）时回落到默认。
+     * 只给 {@code web.port} 这类需要数字的设置用。
+     */
+    public static int getInt(String key, int def) {
+        String v = load().get(key);
+        if (v == null || v.isEmpty()) return def;
+        try {
+            return Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    /**
      * 写一个键（保留文件里其它行与注释）。
      *
      * <p>写成功后立刻清缓存，所以 {@code greet 7:30} 这种命令**当场生效**，不必重启进程。

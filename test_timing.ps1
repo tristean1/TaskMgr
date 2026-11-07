@@ -4,6 +4,9 @@ try {
     $timingOut = Join-Path $PSScriptRoot 'target/timing-check'
     $timingResults = Join-Path $PSScriptRoot 'target/timing-test-results'
     New-Item -ItemType Directory -Force $timingOut, $timingResults | Out-Null
+    # 资源也拷进测试 classpath：WebServer 从 classpath 取 /web/index.html，
+    # 不拷的话网页会走「页面缺失」兜底（历史现象：WebTest 里 4 个静态页断言失败）。
+    Copy-Item -Path 'src/main/resources/*' -Destination $timingOut -Recurse -Force
     $timingCp = "$timingOut;$env:USERPROFILE\.m2\repository\com\google\code\gson\gson\2.11.0\gson-2.11.0.jar;$env:USERPROFILE\.m2\repository\org\xerial\sqlite-jdbc\3.46.0.0\sqlite-jdbc-3.46.0.0.jar;$env:USERPROFILE\.m2\repository\org\slf4j\slf4j-api\1.7.36\slf4j-api-1.7.36.jar;$(Join-Path $PSScriptRoot 'lib/jline-3.27.1.jar')"
     $timingSources = Get-ChildItem src/main/java/*.java, src/test/java/*.java | ForEach-Object FullName
     & javac '-J-Dfile.encoding=UTF-8' -encoding UTF-8 --add-modules jdk.httpserver -cp $timingCp -d $timingOut $timingSources
@@ -73,6 +76,17 @@ try {
     $greetExit = $LASTEXITCODE
     Get-Content -Encoding UTF8 $greetResults
     if ($greetExit -ne 0) { throw 'Greet / REQ-021+022 tests failed' }
+    # 2026-11-07 REQ-023（网页界面 v1：静态页 / list -json / POST /api/cmd / 绝对时刻）
+    # 注意：WebTest 绑 127.0.0.1:0（系统分配端口），不占 8080、不碰真库。
+    $webResults = Join-Path $timingResults 'web-results.txt'
+    & java '-Dfile.encoding=UTF-8' -cp $timingCp WebTest $timingResults
+    $webExit = $LASTEXITCODE
+    Get-Content -Encoding UTF8 $webResults
+    if ($webExit -ne 0) { throw 'Web / REQ-023 tests failed' }
+    & java '-Dfile.encoding=UTF-8' -cp $timingCp AuditTest $timingResults
+    $auditExit = $LASTEXITCODE
+    Get-Content -Encoding UTF8 (Join-Path $timingResults 'audit-results.txt')
+    if ($auditExit -ne 0) { throw 'Audit regression tests failed' }
 } finally {
     Pop-Location
 }

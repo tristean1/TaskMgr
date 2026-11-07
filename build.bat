@@ -6,6 +6,7 @@ set "CP=%USERPROFILE%\.m2\repository\com\google\code\gson\gson\2.11.0\gson-2.11.
 if not exist target\classes mkdir target\classes
 javac --add-modules jdk.httpserver -encoding UTF-8 -cp "%CP%" -d target\classes src\main\java\*.java
 if errorlevel 1 exit /b 1
-if exist src\main\resources xcopy /Y /I /Q src\main\resources\* target\classes\ >nul
+rem /S /E：resources 下有子目录（web\index.html），不带就会漏拷，网页变成 404
+if exist src\main\resources xcopy /Y /I /Q /S /E src\main\resources\* target\classes\ >nul
 echo EXIT=0
 exit /b 0
